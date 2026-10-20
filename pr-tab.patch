@@ -1,0 +1,2816 @@
+diff --git a/pkg/commands/git_commands/github.go b/pkg/commands/git_commands/github.go
+index 85893615d..36fd5f1b0 100644
+--- a/pkg/commands/git_commands/github.go
++++ b/pkg/commands/git_commands/github.go
+@@ -3,6 +3,7 @@ package git_commands
+ import (
+ 	"bytes"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -11,8 +12,10 @@ import (
+ 	"time"
+ 
+ 	"github.com/cli/go-gh/v2/pkg/auth"
++	"github.com/jesseduffield/gocui"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/hosting_service"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/models"
++	"github.com/jesseduffield/lazygit/pkg/commands/oscommands"
+ 	"github.com/samber/lo"
+ 	"golang.org/x/sync/errgroup"
+ )
+@@ -21,6 +24,27 @@ type GitHubCommands struct {
+ 	*GitCommon
+ }
+ 
++// ErrGithubRepoNotFound is returned when the GitHub account cannot resolve the
++// repository (e.g. private or deleted), so the UI can show an empty PR list
++// instead of an error.
++var ErrGithubRepoNotFound = errors.New("GitHub repository not found")
++
++type graphQLError struct {
++	Message string `json:"message"`
++	Type    string `json:"type"`
++}
++
++// repoNotFoundError returns a wrapped ErrGithubRepoNotFound if the GraphQL
++// response reports the repository could not be resolved.
++func repoNotFoundError(errs []graphQLError) error {
++	for _, e := range errs {
++		if e.Type == "NOT_FOUND" {
++			return fmt.Errorf("%w: %s", ErrGithubRepoNotFound, e.Message)
++		}
++	}
++	return nil
++}
++
+ func NewGitHubCommands(gitCommon *GitCommon) *GitHubCommands {
+ 	return &GitHubCommands{
+ 		GitCommon: gitCommon,
+@@ -62,7 +86,8 @@ func (self *GitHubCommands) SetConfiguredBaseRemoteName(remoteName string) error
+ }
+ 
+ type Response struct {
+-	Data RepositoryQuery `json:"data"`
++	Errors []graphQLError  `json:"errors"`
++	Data   RepositoryQuery `json:"data"`
+ }
+ 
+ type RepositoryQuery struct {
+@@ -78,6 +103,7 @@ type PullRequestEdge struct {
+ }
+ 
+ type PullRequestNode struct {
++	ID                  string                `json:"id"`
+ 	Title               string                `json:"title"`
+ 	HeadRefName         string                `json:"headRefName"`
+ 	Number              int                   `json:"number"`
+@@ -85,6 +111,29 @@ type PullRequestNode struct {
+ 	HeadRepositoryOwner GithubRepositoryOwner `json:"headRepositoryOwner"`
+ 	State               string                `json:"state"`
+ 	IsDraft             bool                  `json:"isDraft"`
++	Author              GithubRepositoryOwner `json:"author"`
++	ReviewDecision      string                `json:"reviewDecision"`
++	Commits             struct {
++		Nodes []struct {
++			Commit *struct {
++				StatusCheckRollup *struct {
++					State string `json:"state"`
++				} `json:"statusCheckRollup"`
++			} `json:"commit"`
++		} `json:"nodes"`
++	} `json:"commits"`
++	ReviewRequests struct {
++		Nodes []struct {
++			RequestedReviewer *struct {
++				Login string `json:"login"`
++			} `json:"requestedReviewer"`
++		} `json:"nodes"`
++	} `json:"reviewRequests"`
++	Assignees struct {
++		Nodes []struct {
++			Login string `json:"login"`
++		} `json:"nodes"`
++	} `json:"assignees"`
+ }
+ 
+ type GithubRepositoryOwner struct {
+@@ -96,6 +145,792 @@ type graphQLRequest struct {
+ 	Variables map[string]string `json:"variables"`
+ }
+ 
++const (
++	addCommentMutation       = `mutation($subjectId: ID!, $body: String!) { addComment(input: {subjectId: $subjectId, body: $body}) { clientMutationId } }`
++	addReviewMutation        = `mutation($pullRequestId: ID!, $event: PullRequestReviewEvent!, $body: String) { addPullRequestReview(input: {pullRequestId: $pullRequestId, event: $event, body: $body}) { pullRequestReview { id } } }`
++	mergeMethodsQuery        = `query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { mergeCommitAllowed squashMergeAllowed rebaseMergeAllowed viewerDefaultMergeMethod } }`
++	mergePullRequestMutation = `mutation($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!) { mergePullRequest(input: {pullRequestId: $pullRequestId, mergeMethod: $mergeMethod}) { clientMutationId } }`
++)
++
++const openPullRequestsQuery = `query($q: String!) {
++  viewer {
++    login
++  }
++  search(query: $q, type: ISSUE_ADVANCED, first: 100) {
++    nodes {
++      ... on PullRequest {
++        id
++        title
++        headRefName
++        state
++        number
++        url
++        isDraft
++        reviewDecision
++        headRepositoryOwner {
++          login
++        }
++        author {
++          login
++        }
++        commits(last: 1) {
++          nodes {
++            commit {
++              statusCheckRollup {
++                state
++              }
++            }
++          }
++        }
++        reviewRequests(first: 20) {
++          nodes {
++            requestedReviewer {
++              ... on User { login }
++            }
++          }
++        }
++        assignees(first: 20) {
++          nodes {
++            login
++          }
++        }
++      }
++    }
++  }
++}`
++
++// buildOpenPullRequestsSearch builds the GitHub search query for the PR list.
++// An empty filter means "is:open"; sort:updated-desc is added unless the filter already sorts.
++func buildOpenPullRequestsSearch(owner, name, filter string) string {
++	if strings.TrimSpace(filter) == "" {
++		filter = "is:open"
++	}
++	if !hasSortTerm(filter) {
++		filter += " sort:updated-desc"
++	}
++	return fmt.Sprintf("repo:%s/%s is:pr %s", owner, name, filter)
++}
++
++func hasSortTerm(filter string) bool {
++	for _, term := range strings.Fields(filter) {
++		if strings.HasPrefix(term, "sort:") {
++			return true
++		}
++	}
++	return false
++}
++
++type OpenPullRequestsResponse struct {
++	Errors []graphQLError `json:"errors"`
++	Data   struct {
++		Viewer struct {
++			Login string `json:"login"`
++		} `json:"viewer"`
++		Search struct {
++			Nodes []PullRequestNode `json:"nodes"`
++		} `json:"search"`
++	} `json:"data"`
++}
++
++func parseOpenPullRequests(body []byte) ([]*models.GithubPullRequest, error) {
++	var result OpenPullRequestsResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return nil, err
++	}
++
++	if len(result.Errors) > 0 {
++		if err := repoNotFoundError(result.Errors); err != nil {
++			return nil, err
++		}
++		messages := make([]string, len(result.Errors))
++		for i, e := range result.Errors {
++			messages[i] = e.Message
++		}
++		return nil, fmt.Errorf("GitHub GraphQL error: %s", strings.Join(messages, "; "))
++	}
++
++	viewer := result.Data.Viewer.Login
++	prs := []*models.GithubPullRequest{}
++	for _, node := range result.Data.Search.Nodes {
++		assignedToMe := false
++		for _, a := range node.Assignees.Nodes {
++			if a.Login == viewer {
++				assignedToMe = true
++			}
++		}
++		for _, r := range node.ReviewRequests.Nodes {
++			if r.RequestedReviewer != nil && r.RequestedReviewer.Login == viewer {
++				assignedToMe = true
++			}
++		}
++
++		checksState := ""
++		if len(node.Commits.Nodes) > 0 && node.Commits.Nodes[0].Commit != nil && node.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
++			checksState = node.Commits.Nodes[0].Commit.StatusCheckRollup.State
++		}
++
++		prs = append(prs, &models.GithubPullRequest{
++			HeadRefName: node.HeadRefName,
++			Number:      node.Number,
++			NodeID:      node.ID,
++			Title:       node.Title,
++			State:       lo.Ternary(node.IsDraft && node.State != "CLOSED", "DRAFT", node.State),
++			Url:         node.Url,
++			Author:      node.Author.Login,
++			HeadRepositoryOwner: models.GithubRepositoryOwner{
++				Login: node.HeadRepositoryOwner.Login,
++			},
++			ReviewDecision: node.ReviewDecision,
++			ChecksState:    checksState,
++			AssignedToMe:   assignedToMe,
++		})
++	}
++
++	return prs, nil
++}
++
++type mutationResponse struct {
++	Errors []struct {
++		Message string `json:"message"`
++	} `json:"errors"`
++}
++
++func parseMutationResponse(body []byte) error {
++	var result mutationResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return err
++	}
++
++	if len(result.Errors) > 0 {
++		messages := make([]string, len(result.Errors))
++		for i, e := range result.Errors {
++			messages[i] = e.Message
++		}
++		return fmt.Errorf("GitHub GraphQL error: %s", strings.Join(messages, "; "))
++	}
++
++	return nil
++}
++
++type mergeMethodsResponse struct {
++	Data struct {
++		Repository *struct {
++			MergeCommitAllowed       bool   `json:"mergeCommitAllowed"`
++			SquashMergeAllowed       bool   `json:"squashMergeAllowed"`
++			RebaseMergeAllowed       bool   `json:"rebaseMergeAllowed"`
++			ViewerDefaultMergeMethod string `json:"viewerDefaultMergeMethod"`
++		} `json:"repository"`
++	} `json:"data"`
++}
++
++func parseMergeMethods(body []byte) ([]string, error) {
++	if err := parseMutationResponse(body); err != nil {
++		return nil, err
++	}
++
++	var result mergeMethodsResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return nil, err
++	}
++
++	repo := result.Data.Repository
++	if repo == nil {
++		return nil, errors.New("repository not found")
++	}
++
++	methods := []string{}
++	if repo.MergeCommitAllowed {
++		methods = append(methods, "MERGE")
++	}
++	if repo.SquashMergeAllowed {
++		methods = append(methods, "SQUASH")
++	}
++	if repo.RebaseMergeAllowed {
++		methods = append(methods, "REBASE")
++	}
++	if len(methods) == 0 {
++		return nil, errors.New("no merge methods allowed")
++	}
++
++	// Move the viewer's default method to the front
++	if i := lo.IndexOf(methods, repo.ViewerDefaultMergeMethod); i > 0 {
++		d := methods[i]
++		methods = append([]string{d}, lo.Without(methods, d)...)
++	}
++
++	return methods, nil
++}
++
++func (self *GitHubCommands) postGraphQL(query string, variables map[string]string, token string) ([]byte, error) {
++	bodyBytes, err := json.Marshal(graphQLRequest{Query: query, Variables: variables})
++	if err != nil {
++		return nil, err
++	}
++	req, err := http.NewRequest("POST", "https://api.github.com/graphql", bytes.NewBuffer(bodyBytes))
++	if err != nil {
++		return nil, err
++	}
++
++	req.Header.Set("Authorization", "token "+token)
++	req.Header.Set("Content-Type", "application/json")
++
++	client := &http.Client{}
++	resp, err := client.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++
++	if resp.StatusCode != http.StatusOK {
++		bodyStr := new(bytes.Buffer)
++		_, _ = bodyStr.ReadFrom(resp.Body)
++		return nil, fmt.Errorf("GraphQL query failed with status: %s. Body: %s", resp.Status, bodyStr.String())
++	}
++
++	return io.ReadAll(resp.Body)
++}
++
++// PullRequestLineComment describes a comment on a PR diff. StartLine 0 means a single-line comment.
++type PullRequestLineComment struct {
++	CommitID  string
++	Path      string
++	Body      string
++	Line      int
++	StartLine int
++}
++
++func pullRequestLineCommentPayload(c PullRequestLineComment) map[string]any {
++	payload := map[string]any{
++		"body":      c.Body,
++		"commit_id": c.CommitID,
++		"path":      c.Path,
++		"line":      c.Line,
++		"side":      "RIGHT",
++	}
++	if 0 < c.StartLine && c.StartLine < c.Line {
++		payload["start_line"] = c.StartLine
++		payload["start_side"] = "RIGHT"
++	}
++	return payload
++}
++
++type restErrorResponse struct {
++	Message string          `json:"message"`
++	Errors  []restErrorItem `json:"errors"`
++}
++
++type restErrorItem struct {
++	Message string `json:"message"`
++}
++
++// UnmarshalJSON accepts either a plain string or an object with a message field.
++func (e *restErrorItem) UnmarshalJSON(data []byte) error {
++	var s string
++	if err := json.Unmarshal(data, &s); err == nil {
++		e.Message = s
++		return nil
++	}
++	var obj struct {
++		Message string `json:"message"`
++	}
++	if err := json.Unmarshal(data, &obj); err != nil {
++		return err
++	}
++	e.Message = obj.Message
++	return nil
++}
++
++func parseRESTError(status string, body []byte) error {
++	var result restErrorResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return fmt.Errorf("GitHub API error (%s): %s", status, string(body))
++	}
++
++	msg := result.Message
++	itemMessages := make([]string, 0, len(result.Errors))
++	for _, e := range result.Errors {
++		if e.Message != "" {
++			itemMessages = append(itemMessages, e.Message)
++		}
++	}
++	if len(itemMessages) > 0 {
++		msg = msg + ": " + strings.Join(itemMessages, "; ")
++	}
++	return fmt.Errorf("GitHub API error (%s): %s", status, msg)
++}
++
++// AddPullRequestLineComment adds a comment on a PR diff via the REST API.
++func (self *GitHubCommands) AddPullRequestLineComment(baseRemote *models.Remote, number int, c PullRequestLineComment, token string) error {
++	repoOwner, repoName, err := self.GetBaseRepoOwnerAndName(baseRemote)
++	if err != nil {
++		return err
++	}
++
++	bodyBytes, err := json.Marshal(pullRequestLineCommentPayload(c))
++	if err != nil {
++		return err
++	}
++
++	url := fmt.Sprintf("https://api.github.com/repos/%s/%s/pulls/%d/comments", repoOwner, repoName, number)
++	req, err := http.NewRequest("POST", url, bytes.NewBuffer(bodyBytes))
++	if err != nil {
++		return err
++	}
++
++	req.Header.Set("Authorization", "token "+token)
++	req.Header.Set("Accept", "application/vnd.github+json")
++	req.Header.Set("Content-Type", "application/json")
++
++	client := &http.Client{}
++	resp, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return err
++	}
++
++	if resp.StatusCode == http.StatusCreated {
++		return nil
++	}
++	return parseRESTError(resp.Status, respBody)
++}
++
++// FetchOpenPullRequests fetches the repo's pull requests matching the GitHub search filter.
++func (self *GitHubCommands) FetchOpenPullRequests(baseRemote *models.Remote, filter string, token string) ([]*models.GithubPullRequest, error) {
++	repoOwner, repoName, err := self.GetBaseRepoOwnerAndName(baseRemote)
++	if err != nil {
++		return nil, err
++	}
++
++	q := buildOpenPullRequestsSearch(repoOwner, repoName, filter)
++	body, err := self.postGraphQL(openPullRequestsQuery, map[string]string{"q": q}, token)
++	if err != nil {
++		return nil, err
++	}
++
++	return parseOpenPullRequests(body)
++}
++
++// AddPullRequestComment adds a comment to a pull request.
++func (self *GitHubCommands) AddPullRequestComment(nodeID string, body string, token string) error {
++	resp, err := self.postGraphQL(addCommentMutation, map[string]string{"subjectId": nodeID, "body": body}, token)
++	if err != nil {
++		return err
++	}
++	return parseMutationResponse(resp)
++}
++
++// SubmitPullRequestReview submits a review for a pull request. event is "APPROVE" or "REQUEST_CHANGES".
++func (self *GitHubCommands) SubmitPullRequestReview(nodeID string, event string, body string, token string) error {
++	resp, err := self.postGraphQL(addReviewMutation, map[string]string{"pullRequestId": nodeID, "event": event, "body": body}, token)
++	if err != nil {
++		return err
++	}
++	return parseMutationResponse(resp)
++}
++
++// FetchMergeMethods fetches the merge methods allowed for the repository.
++func (self *GitHubCommands) FetchMergeMethods(baseRemote *models.Remote, token string) ([]string, error) {
++	repoOwner, repoName, err := self.GetBaseRepoOwnerAndName(baseRemote)
++	if err != nil {
++		return nil, err
++	}
++
++	body, err := self.postGraphQL(mergeMethodsQuery, map[string]string{"owner": repoOwner, "repo": repoName}, token)
++	if err != nil {
++		return nil, err
++	}
++
++	return parseMergeMethods(body)
++}
++
++// MergePullRequest merges a pull request using the given method.
++func (self *GitHubCommands) MergePullRequest(nodeID string, method string, token string) error {
++	resp, err := self.postGraphQL(mergePullRequestMutation, map[string]string{"pullRequestId": nodeID, "mergeMethod": method}, token)
++	if err != nil {
++		return err
++	}
++	return parseMutationResponse(resp)
++}
++
++func pullRequestDetailsQuery(number int) string {
++	return fmt.Sprintf(`query($owner: String!, $repo: String!) {
++  repository(owner: $owner, name: $repo) {
++    pullRequest(number: %d) {
++      id
++      number
++      title
++      body
++      state
++      isDraft
++      url
++      author {
++        login
++      }
++      reviewDecision
++      reviewRequests(first: 20) {
++        nodes {
++          requestedReviewer {
++            __typename
++            ... on User { login }
++            ... on Bot { login }
++            ... on Team { name }
++          }
++        }
++      }
++      latestOpinionatedReviews(first: 20) {
++        nodes {
++          author { login }
++          state
++        }
++      }
++      commits(last: 1) {
++        nodes {
++          commit {
++            statusCheckRollup {
++              state
++              contexts(first: 50) {
++                nodes {
++                  __typename
++                  ... on CheckRun { name status conclusion }
++                  ... on StatusContext { context state }
++                }
++              }
++            }
++          }
++        }
++      }
++      timelineItems(last: 100, itemTypes: [ISSUE_COMMENT, PULL_REQUEST_REVIEW]) {
++        nodes {
++          __typename
++          ... on IssueComment {
++            id
++            isMinimized
++            minimizedReason
++            author { login }
++            body
++            createdAt
++          }
++          ... on PullRequestReview {
++            isMinimized
++            minimizedReason
++            author { login }
++            state
++            body
++            createdAt
++            comments(first: 50) {
++              nodes {
++                id
++                isMinimized
++                minimizedReason
++                author { login }
++                body
++                path
++                createdAt
++              }
++            }
++          }
++        }
++      }
++      reviewThreads(first: 100) {
++        nodes {
++          isResolved
++          comments(first: 100) {
++            nodes {
++              id
++            }
++          }
++        }
++      }
++    }
++  }
++}`, number)
++}
++
++type PullRequestDetailsResponse struct {
++	Errors []struct {
++		Message string `json:"message"`
++	} `json:"errors"`
++	Data struct {
++		Repository struct {
++			PullRequest *struct {
++				ID             string                        `json:"id"`
++				Number         int                           `json:"number"`
++				Title          string                        `json:"title"`
++				Body           string                        `json:"body"`
++				State          string                        `json:"state"`
++				IsDraft        bool                          `json:"isDraft"`
++				Url            string                        `json:"url"`
++				Author         *models.GithubRepositoryOwner `json:"author"`
++				ReviewDecision string                        `json:"reviewDecision"`
++				ReviewRequests struct {
++					Nodes []struct {
++						RequestedReviewer *struct {
++							Typename string `json:"__typename"`
++							Login    string `json:"login"`
++							Name     string `json:"name"`
++						} `json:"requestedReviewer"`
++					} `json:"nodes"`
++				} `json:"reviewRequests"`
++				LatestOpinionatedReviews struct {
++					Nodes []struct {
++						Author *models.GithubRepositoryOwner `json:"author"`
++						State  string                        `json:"state"`
++					} `json:"nodes"`
++				} `json:"latestOpinionatedReviews"`
++				Commits struct {
++					Nodes []struct {
++						Commit *struct {
++							StatusCheckRollup *struct {
++								State    string `json:"state"`
++								Contexts struct {
++									Nodes []struct {
++										Typename   string `json:"__typename"`
++										Name       string `json:"name"`
++										Status     string `json:"status"`
++										Conclusion string `json:"conclusion"`
++										Context    string `json:"context"`
++										State      string `json:"state"`
++									} `json:"nodes"`
++								} `json:"contexts"`
++							} `json:"statusCheckRollup"`
++						} `json:"commit"`
++					} `json:"nodes"`
++				} `json:"commits"`
++				TimelineItems struct {
++					Nodes []struct {
++						Typename        string                        `json:"__typename"`
++						ID              string                        `json:"id"`
++						IsMinimized     bool                          `json:"isMinimized"`
++						MinimizedReason string                        `json:"minimizedReason"`
++						Author          *models.GithubRepositoryOwner `json:"author"`
++						Body            string                        `json:"body"`
++						CreatedAt       string                        `json:"createdAt"`
++						State           string                        `json:"state"`
++						Comments        struct {
++							Nodes []struct {
++								ID              string                        `json:"id"`
++								IsMinimized     bool                          `json:"isMinimized"`
++								MinimizedReason string                        `json:"minimizedReason"`
++								Author          *models.GithubRepositoryOwner `json:"author"`
++								Body            string                        `json:"body"`
++								Path            string                        `json:"path"`
++								CreatedAt       string                        `json:"createdAt"`
++							} `json:"nodes"`
++						} `json:"comments"`
++					} `json:"nodes"`
++				} `json:"timelineItems"`
++				ReviewThreads struct {
++					Nodes []struct {
++						IsResolved bool `json:"isResolved"`
++						Comments   struct {
++							Nodes []struct {
++								ID string `json:"id"`
++							} `json:"nodes"`
++						} `json:"comments"`
++					} `json:"nodes"`
++				} `json:"reviewThreads"`
++			} `json:"pullRequest"`
++		} `json:"repository"`
++	} `json:"data"`
++}
++
++func authorLogin(a *models.GithubRepositoryOwner) string {
++	if a == nil {
++		return "ghost"
++	}
++	return a.Login
++}
++
++func parseCreatedAt(s string) time.Time {
++	t, _ := time.Parse(time.RFC3339, s)
++	return t
++}
++
++func hiddenReason(isMinimized bool, reason string) string {
++	if !isMinimized {
++		return ""
++	}
++	h := strings.ToLower(strings.ReplaceAll(reason, "_", "-"))
++	if h == "" {
++		h = "hidden"
++	}
++	return h
++}
++
++func parsePullRequestDetails(body []byte) (*models.GithubPullRequestDetails, error) {
++	var result PullRequestDetailsResponse
++	if err := json.Unmarshal(body, &result); err != nil {
++		return nil, err
++	}
++
++	if len(result.Errors) > 0 {
++		messages := make([]string, len(result.Errors))
++		for i, e := range result.Errors {
++			messages[i] = e.Message
++		}
++		return nil, fmt.Errorf("GitHub GraphQL error: %s", strings.Join(messages, "; "))
++	}
++
++	pr := result.Data.Repository.PullRequest
++	if pr == nil {
++		return nil, errors.New("pull request not found")
++	}
++
++	state := pr.State
++	if pr.IsDraft && state == "OPEN" {
++		state = "DRAFT"
++	}
++
++	reviewers := []models.GithubReviewer{}
++	for _, node := range pr.LatestOpinionatedReviews.Nodes {
++		reviewers = append(reviewers, models.GithubReviewer{
++			Login: authorLogin(node.Author),
++			State: node.State,
++		})
++	}
++	for _, node := range pr.ReviewRequests.Nodes {
++		if node.RequestedReviewer == nil {
++			continue
++		}
++		login := node.RequestedReviewer.Login
++		if node.RequestedReviewer.Typename == "Team" {
++			login = node.RequestedReviewer.Name
++		}
++		found := false
++		for i := range reviewers {
++			if reviewers[i].Login == login {
++				reviewers[i].State = "PENDING"
++				found = true
++				break
++			}
++		}
++		if !found {
++			reviewers = append(reviewers, models.GithubReviewer{Login: login, State: "PENDING"})
++		}
++	}
++
++	checksState := ""
++	checks := []models.GithubCheck{}
++	if len(pr.Commits.Nodes) > 0 && pr.Commits.Nodes[0].Commit != nil && pr.Commits.Nodes[0].Commit.StatusCheckRollup != nil {
++		rollup := pr.Commits.Nodes[0].Commit.StatusCheckRollup
++		checksState = rollup.State
++		for _, node := range rollup.Contexts.Nodes {
++			switch node.Typename {
++			case "CheckRun":
++				status := node.Status
++				if node.Status == "COMPLETED" {
++					status = node.Conclusion
++				}
++				checks = append(checks, models.GithubCheck{Name: node.Name, Status: status})
++			case "StatusContext":
++				checks = append(checks, models.GithubCheck{Name: node.Context, Status: node.State})
++			}
++		}
++	}
++
++	// Build resolved-thread map: inline comment id -> (threadFirstId, threadSize)
++	resolvedThreadMap := map[string]struct {
++		firstID string
++		size    int
++	}{}
++	for _, rt := range pr.ReviewThreads.Nodes {
++		if !rt.IsResolved || len(rt.Comments.Nodes) == 0 {
++			continue
++		}
++		firstID := rt.Comments.Nodes[0].ID
++		for _, c := range rt.Comments.Nodes {
++			resolvedThreadMap[c.ID] = struct {
++				firstID string
++				size    int
++			}{firstID: firstID, size: len(rt.Comments.Nodes)}
++		}
++	}
++
++	comments := []models.GithubComment{}
++	for _, item := range pr.TimelineItems.Nodes {
++		switch item.Typename {
++		case "IssueComment":
++			c := models.GithubComment{
++				Author:    authorLogin(item.Author),
++				Body:      item.Body,
++				CreatedAt: parseCreatedAt(item.CreatedAt),
++			}
++			c.Hidden = hiddenReason(item.IsMinimized, item.MinimizedReason)
++			comments = append(comments, c)
++		case "PullRequestReview":
++			if item.Body != "" || item.State != "COMMENTED" {
++				c := models.GithubComment{
++					Author:      authorLogin(item.Author),
++					Body:        item.Body,
++					ReviewState: item.State,
++					CreatedAt:   parseCreatedAt(item.CreatedAt),
++				}
++				c.Hidden = hiddenReason(item.IsMinimized, item.MinimizedReason)
++				comments = append(comments, c)
++			}
++			for _, c := range item.Comments.Nodes {
++				if tid, ok := resolvedThreadMap[c.ID]; ok {
++					if c.ID == tid.firstID {
++						comments = append(comments, models.GithubComment{
++							Author:     authorLogin(c.Author),
++							Body:       c.Body,
++							Path:       c.Path,
++							CreatedAt:  parseCreatedAt(c.CreatedAt),
++							Resolved:   true,
++							ThreadSize: tid.size,
++							Hidden:     hiddenReason(c.IsMinimized, c.MinimizedReason),
++						})
++					}
++					// skip non-first comments in resolved threads
++				} else {
++					comments = append(comments, models.GithubComment{
++						Author:    authorLogin(c.Author),
++						Body:      c.Body,
++						Path:      c.Path,
++						CreatedAt: parseCreatedAt(c.CreatedAt),
++						Hidden:    hiddenReason(c.IsMinimized, c.MinimizedReason),
++					})
++				}
++			}
++		}
++	}
++
++	return &models.GithubPullRequestDetails{
++		NodeID:         pr.ID,
++		Number:         pr.Number,
++		Title:          pr.Title,
++		Body:           pr.Body,
++		Url:            pr.Url,
++		Author:         authorLogin(pr.Author),
++		State:          state,
++		ReviewDecision: pr.ReviewDecision,
++		Reviewers:      reviewers,
++		ChecksState:    checksState,
++		Checks:         checks,
++		Comments:       comments,
++	}, nil
++}
++
++// FetchPullRequestDetails fetches the details of a single pull request using GraphQL.
++func (self *GitHubCommands) FetchPullRequestDetails(baseRemote *models.Remote, number int, token string) (*models.GithubPullRequestDetails, error) {
++	repoOwner, repoName, err := self.GetBaseRepoOwnerAndName(baseRemote)
++	if err != nil {
++		return nil, err
++	}
++
++	body, err := self.postGraphQL(pullRequestDetailsQuery(number), map[string]string{"owner": repoOwner, "repo": repoName}, token)
++	if err != nil {
++		return nil, err
++	}
++
++	return parsePullRequestDetails(body)
++}
++
+ func fetchPullRequestsQuery(branches []string, owner string, repo string) (string, map[string]string) {
+ 	variables := make(map[string]string, len(branches)+2)
+ 	variables["owner"] = owner
+@@ -231,12 +1066,26 @@ func (self *GitHubCommands) fetchRecentPRsAux(repoOwner string, repoName string,
+ 		return nil, err
+ 	}
+ 
++	return parseRecentPRsResponse(respBytes)
++}
++
++func parseRecentPRsResponse(body []byte) ([]*models.GithubPullRequest, error) {
+ 	var result Response
+-	err = json.Unmarshal(respBytes, &result)
+-	if err != nil {
++	if err := json.Unmarshal(body, &result); err != nil {
+ 		return nil, err
+ 	}
+ 
++	if len(result.Errors) > 0 {
++		if err := repoNotFoundError(result.Errors); err != nil {
++			return nil, err
++		}
++		messages := make([]string, len(result.Errors))
++		for i, e := range result.Errors {
++			messages[i] = e.Message
++		}
++		return nil, fmt.Errorf("GitHub GraphQL error: %s", strings.Join(messages, "; "))
++	}
++
+ 	prs := []*models.GithubPullRequest{}
+ 	for _, repoQuery := range result.Data.Repository {
+ 		for _, edge := range repoQuery.Edges {
+@@ -378,3 +1227,34 @@ func (self *GitHubCommands) GetBaseRepoOwnerAndName(baseRemote *models.Remote) (
+ 
+ 	return repoInfo.Owner, repoInfo.Repository, nil
+ }
++
++func (self *GitHubCommands) FetchPullRequestCmdObj(task gocui.Task, remoteName string, number int, branchName string) *oscommands.CmdObj {
++	cmdArgs := NewGitCmd("fetch").
++		Arg(remoteName).
++		Arg(fmt.Sprintf("pull/%d/head:%s", number, branchName)).
++		ToArgv()
++
++	cmdObj := self.cmd.New(cmdArgs)
++	cmdObj.PromptOnCredentialRequest(task)
++	return cmdObj
++}
++
++func (self *GitHubCommands) FetchPullRequestRefCmdObj(task gocui.Task, remoteName string, number int) *oscommands.CmdObj {
++	cmdArgs := NewGitCmd("fetch").
++		Arg(remoteName).
++		Arg(fmt.Sprintf("+pull/%d/head:%s", number, (&models.GithubPullRequestRef{Number: number}).FullRefName())).
++		ToArgv()
++
++	cmdObj := self.cmd.New(cmdArgs)
++	cmdObj.PromptOnCredentialRequest(task)
++	return cmdObj
++}
++
++// Fork PRs often use branch names like "master" that would clash with local
++// branches, so prefix with the head repo owner in that case.
++func PullRequestLocalBranchName(pr *models.GithubPullRequest, baseOwner string) string {
++	if strings.EqualFold(pr.HeadRepositoryOwner.Login, baseOwner) {
++		return pr.HeadRefName
++	}
++	return pr.HeadRepositoryOwner.Login + "/" + pr.HeadRefName
++}
+diff --git a/pkg/commands/git_commands/github_test.go b/pkg/commands/git_commands/github_test.go
+index d9d55ffd1..d452b20ad 100644
+--- a/pkg/commands/git_commands/github_test.go
++++ b/pkg/commands/git_commands/github_test.go
+@@ -57,6 +57,68 @@ func TestGetRepoInfoFromURL(t *testing.T) {
+ 	}
+ }
+ 
++func TestParseMergeMethods(t *testing.T) {
++	cases := []struct {
++		name     string
++		body     string
++		expected []string
++		wantErr  bool
++	}{
++		{
++			name:     "all allowed with default MERGE",
++			body:     `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true,"viewerDefaultMergeMethod":"MERGE"}}}`,
++			expected: []string{"MERGE", "SQUASH", "REBASE"},
++		},
++		{
++			name:     "all allowed with default SQUASH",
++			body:     `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true,"viewerDefaultMergeMethod":"SQUASH"}}}`,
++			expected: []string{"SQUASH", "MERGE", "REBASE"},
++		},
++		{
++			name:     "all allowed with default REBASE",
++			body:     `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true,"viewerDefaultMergeMethod":"REBASE"}}}`,
++			expected: []string{"REBASE", "MERGE", "SQUASH"},
++		},
++		{
++			name:     "squash and rebase with default SQUASH",
++			body:     `{"data":{"repository":{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true,"viewerDefaultMergeMethod":"SQUASH"}}}`,
++			expected: []string{"SQUASH", "REBASE"},
++		},
++		{
++			name:     "default REBASE disallowed",
++			body:     `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":false,"viewerDefaultMergeMethod":"REBASE"}}}`,
++			expected: []string{"MERGE", "SQUASH"},
++		},
++		{
++			name:    "graphql errors",
++			body:    `{"errors":[{"message":"boom"}]}`,
++			wantErr: true,
++		},
++		{
++			name:    "null repository",
++			body:    `{"data":{"repository":null}}`,
++			wantErr: true,
++		},
++		{
++			name:    "none allowed",
++			body:    `{"data":{"repository":{"mergeCommitAllowed":false,"squashMergeAllowed":false,"rebaseMergeAllowed":false,"viewerDefaultMergeMethod":"MERGE"}}}`,
++			wantErr: true,
++		},
++	}
++
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			result, err := parseMergeMethods([]byte(c.body))
++			if c.wantErr {
++				assert.Error(t, err)
++			} else {
++				assert.NoError(t, err)
++				assert.Equal(t, c.expected, result)
++			}
++		})
++	}
++}
++
+ func TestGenerateGithubPullRequestMap(t *testing.T) {
+ 	cases := []struct {
+ 		name     string
+diff --git a/pkg/commands/models/github.go b/pkg/commands/models/github.go
+index 6477c6ee6..77769c0f4 100644
+--- a/pkg/commands/models/github.go
++++ b/pkg/commands/models/github.go
+@@ -1,12 +1,31 @@
+ package models
+ 
++import (
++	"fmt"
++	"strconv"
++	"time"
++)
++
+ type GithubPullRequest struct {
+ 	HeadRefName         string                `json:"headRefName"`
+ 	Number              int                   `json:"number"`
++	NodeID              string                `json:"nodeId"`
+ 	Title               string                `json:"title"`
+ 	State               string                `json:"state"` // "MERGED", "OPEN", "CLOSED", "DRAFT"
+ 	Url                 string                `json:"url"`
++	Author              string                `json:"author"`
+ 	HeadRepositoryOwner GithubRepositoryOwner `json:"headRepositoryOwner"`
++	ReviewDecision      string                `json:"reviewDecision"`
++	ChecksState         string                `json:"checksState"`
++	AssignedToMe        bool                  `json:"assignedToMe"`
++}
++
++func (pr *GithubPullRequest) ID() string {
++	return strconv.Itoa(pr.Number)
++}
++
++func (pr *GithubPullRequest) URN() string {
++	return "pr-" + pr.ID()
+ }
+ 
+ func (pr *GithubPullRequest) UserName() string {
+@@ -22,3 +41,64 @@ func (pr *GithubPullRequest) BranchName() string {
+ type GithubRepositoryOwner struct {
+ 	Login string `json:"login"`
+ }
++
++type GithubPullRequestRef struct {
++	Number int
++	Title  string
++}
++
++func (self *GithubPullRequestRef) FullRefName() string {
++	return fmt.Sprintf("refs/lazygit/pull/%d", self.Number)
++}
++
++func (self *GithubPullRequestRef) RefName() string {
++	return fmt.Sprintf("#%d", self.Number)
++}
++
++func (self *GithubPullRequestRef) ShortRefName() string {
++	return self.RefName()
++}
++
++func (self *GithubPullRequestRef) ParentRefName() string {
++	return self.FullRefName() + "^"
++}
++
++func (self *GithubPullRequestRef) Description() string {
++	return self.Title
++}
++
++type GithubPullRequestDetails struct {
++	NodeID         string           `json:"nodeId"`
++	Number         int              `json:"number"`
++	Title          string           `json:"title"`
++	Body           string           `json:"body"`
++	Url            string           `json:"url"`
++	Author         string           `json:"author"`
++	State          string           `json:"state"`
++	ReviewDecision string           `json:"reviewDecision"`
++	Reviewers      []GithubReviewer `json:"reviewers"`
++	ChecksState    string           `json:"checksState"`
++	Checks         []GithubCheck    `json:"checks"`
++	Comments       []GithubComment  `json:"comments"`
++}
++
++type GithubReviewer struct {
++	Login string `json:"login"`
++	State string `json:"state"`
++}
++
++type GithubCheck struct {
++	Name   string `json:"name"`
++	Status string `json:"status"`
++}
++
++type GithubComment struct {
++	Author      string    `json:"author"`
++	Body        string    `json:"body"`
++	ReviewState string    `json:"reviewState"`
++	Path        string    `json:"path"`
++	CreatedAt   time.Time `json:"createdAt"`
++	Resolved    bool      `json:"resolved"`
++	ThreadSize  int       `json:"threadSize"`
++	Hidden      string    `json:"hidden"`
++}
+diff --git a/pkg/config/user_config.go b/pkg/config/user_config.go
+index 29778d639..7ecb15937 100644
+--- a/pkg/config/user_config.go
++++ b/pkg/config/user_config.go
+@@ -330,6 +330,17 @@ type GitConfig struct {
+ 	RemoteBranchSortOrder string `yaml:"remoteBranchSortOrder" jsonschema:"enum=date,enum=alphabetical"`
+ 	// When copying commit hashes to the clipboard, truncate them to this length. Set to 40 to disable truncation.
+ 	TruncateCopiedCommitHashesTo int `yaml:"truncateCopiedCommitHashesTo"`
++	// Config relating to the pull requests tab
++	PullRequests PullRequestsConfig `yaml:"pullRequests"`
++}
++
++type PullRequestsConfig struct {
++	// If false, lazygit sends no requests to list open pull requests and the Pull requests tab stays empty.
++	Enabled bool `yaml:"enabled"`
++	// GitHub search filter, same syntax as the web pull request list, e.g. "is:open review-requested:@me".
++	Filter string `yaml:"filter"`
++	// glow style for the pull request details: dark, light, dracula, tokyo-night, pink, ascii, notty, or a path to a JSON style file.
++	Style string `yaml:"style"`
+ }
+ 
+ type PagerType string
+@@ -876,6 +887,11 @@ func GetDefaultConfig() *UserConfig {
+ 			BranchPrefix:                 "",
+ 			ParseEmoji:                   false,
+ 			TruncateCopiedCommitHashesTo: 12,
++			PullRequests: PullRequestsConfig{
++				Enabled: true,
++				Filter:  "is:open",
++				Style:   "dark",
++			},
+ 		},
+ 		Refresher: RefresherConfig{
+ 			RefreshInterval: 10,
+diff --git a/pkg/gui/context/context.go b/pkg/gui/context/context.go
+index 8af05e36f..e11e99de1 100644
+--- a/pkg/gui/context/context.go
++++ b/pkg/gui/context/context.go
+@@ -17,6 +17,7 @@ const (
+ 	WORKTREES_CONTEXT_KEY                types.ContextKey = "worktrees"
+ 	REMOTE_BRANCHES_CONTEXT_KEY          types.ContextKey = "remoteBranches"
+ 	TAGS_CONTEXT_KEY                     types.ContextKey = "tags"
++	PULL_REQUESTS_CONTEXT_KEY            types.ContextKey = "pullRequests"
+ 	LOCAL_COMMITS_CONTEXT_KEY            types.ContextKey = "commits"
+ 	REFLOG_COMMITS_CONTEXT_KEY           types.ContextKey = "reflogCommits"
+ 	SUB_COMMITS_CONTEXT_KEY              types.ContextKey = "subCommits"
+@@ -59,6 +60,7 @@ var AllContextKeys = []types.ContextKey{
+ 	WORKTREES_CONTEXT_KEY,
+ 	REMOTE_BRANCHES_CONTEXT_KEY,
+ 	TAGS_CONTEXT_KEY,
++	PULL_REQUESTS_CONTEXT_KEY,
+ 	LOCAL_COMMITS_CONTEXT_KEY,
+ 	REFLOG_COMMITS_CONTEXT_KEY,
+ 	SUB_COMMITS_CONTEXT_KEY,
+@@ -90,6 +92,7 @@ type ContextTree struct {
+ 	Menu                        *MenuContext
+ 	Branches                    *BranchesContext
+ 	Tags                        *TagsContext
++	PullRequests                *PullRequestsContext
+ 	LocalCommits                *LocalCommitsContext
+ 	CommitFiles                 *CommitFilesContext
+ 	Remotes                     *RemotesContext
+@@ -137,6 +140,7 @@ func (self *ContextTree) Flatten() []types.Context {
+ 		self.Remotes,
+ 		self.RemoteBranches,
+ 		self.Tags,
++		self.PullRequests,
+ 		self.Branches,
+ 		self.CommitFiles,
+ 		self.ReflogCommits,
+diff --git a/pkg/gui/context/pull_requests_context.go b/pkg/gui/context/pull_requests_context.go
+new file mode 100644
+index 000000000..7e9258f23
+--- /dev/null
++++ b/pkg/gui/context/pull_requests_context.go
+@@ -0,0 +1,56 @@
++package context
++
++import (
++	"github.com/jesseduffield/lazygit/pkg/commands/models"
++	"github.com/jesseduffield/lazygit/pkg/gui/presentation"
++	"github.com/jesseduffield/lazygit/pkg/gui/types"
++)
++
++type PullRequestsContext struct {
++	*FilteredListViewModel[*models.GithubPullRequest]
++	*ListContextTrait
++}
++
++var _ types.IListContext = (*PullRequestsContext)(nil)
++
++func NewPullRequestsContext(
++	c *ContextCommon,
++) *PullRequestsContext {
++	viewModel := NewFilteredListViewModel(
++		func() []*models.GithubPullRequest { return c.Model().OpenPullRequests },
++		func(pr *models.GithubPullRequest) []string {
++			return []string{"#" + pr.ID(), pr.Title, pr.HeadRefName, pr.Author}
++		},
++	)
++
++	getDisplayStrings := func(_ int, _ int) [][]string {
++		return presentation.GetPullRequestListDisplayStrings(viewModel.GetItems())
++	}
++
++	return &PullRequestsContext{
++		FilteredListViewModel: viewModel,
++		ListContextTrait: &ListContextTrait{
++			Context: NewSimpleContext(NewBaseContext(NewBaseContextOpts{
++				View:       c.Views().PullRequests,
++				WindowName: "branches",
++				Key:        PULL_REQUESTS_CONTEXT_KEY,
++				Kind:       types.SIDE_CONTEXT,
++				Focusable:  true,
++			})),
++			ListRenderer: ListRenderer{
++				list:              viewModel,
++				getDisplayStrings: getDisplayStrings,
++			},
++			c: c,
++		},
++	}
++}
++
++func (self *PullRequestsContext) HandleRender() {
++	if !self.c.UserConfig().Git.PullRequests.Enabled && self.list.Len() == 0 {
++		self.GetViewTrait().SetContent(self.c.Tr.PullRequestsDisabled)
++		self.c.Render()
++		return
++	}
++	self.ListContextTrait.HandleRender()
++}
+diff --git a/pkg/gui/context/setup.go b/pkg/gui/context/setup.go
+index 8f498e6a9..ae6d77f72 100644
+--- a/pkg/gui/context/setup.go
++++ b/pkg/gui/context/setup.go
+@@ -37,6 +37,7 @@ func NewContextTree(c *ContextCommon) *ContextTree {
+ 		SubCommits:      NewSubCommitsContext(c),
+ 		Branches:        NewBranchesContext(c),
+ 		Tags:            NewTagsContext(c),
++		PullRequests:    NewPullRequestsContext(c),
+ 		Stash:           NewStashContext(c),
+ 		Suggestions:     NewSuggestionsContext(c),
+ 		Normal:          NewMainContext(c.Views().Main, "main", NORMAL_MAIN_CONTEXT_KEY, c),
+diff --git a/pkg/gui/controllers.go b/pkg/gui/controllers.go
+index 702ed826d..c40c163c0 100644
+--- a/pkg/gui/controllers.go
++++ b/pkg/gui/controllers.go
+@@ -161,6 +161,7 @@ func (gui *Gui) resetHelpersAndControllers() {
+ 	menuController := controllers.NewMenuController(common)
+ 	localCommitsController := controllers.NewLocalCommitsController(common, syncController.HandlePull)
+ 	tagsController := controllers.NewTagsController(common)
++	pullRequestsController := controllers.NewPullRequestsController(common)
+ 	filesController := controllers.NewFilesController(
+ 		common,
+ 	)
+@@ -227,6 +228,7 @@ func (gui *Gui) resetHelpersAndControllers() {
+ 		gui.State.Contexts.Remotes,
+ 		gui.State.Contexts.Worktrees,
+ 		gui.State.Contexts.Tags,
++		gui.State.Contexts.PullRequests,
+ 		gui.State.Contexts.Branches,
+ 		gui.State.Contexts.RemoteBranches,
+ 		gui.State.Contexts.Files,
+@@ -341,6 +343,10 @@ func (gui *Gui) resetHelpersAndControllers() {
+ 		tagsController,
+ 	)
+ 
++	controllers.AttachControllers(gui.State.Contexts.PullRequests,
++		pullRequestsController,
++	)
++
+ 	controllers.AttachControllers(gui.State.Contexts.Submodules,
+ 		submodulesController,
+ 	)
+diff --git a/pkg/gui/controllers/helpers/refresh_helper.go b/pkg/gui/controllers/helpers/refresh_helper.go
+index 71e5282d9..935da8ea0 100644
+--- a/pkg/gui/controllers/helpers/refresh_helper.go
++++ b/pkg/gui/controllers/helpers/refresh_helper.go
+@@ -1,11 +1,13 @@
+ package helpers
+ 
+ import (
++	stderrors "errors"
+ 	"fmt"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
++	"github.com/go-errors/errors"
+ 	"github.com/jesseduffield/generics/set"
+ 	"github.com/jesseduffield/gocui"
+ 	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
+@@ -36,6 +38,21 @@ type RefreshHelper struct {
+ 	// Keyed by repo path so that switching to a different repo while lazygit is running
+ 	// still triggers the prompt there.
+ 	githubBaseRemotePromptDismissed map[string]bool
++
++	// Tracks repos whose open pull request list has been fetched, so the
++	// background refresh does not re-fetch it on every refresh.
++	openPullRequestsLoaded map[string]bool
++
++	// Tracks the most recent open-pull-requests fetch error per repo, so that
++	// OnFocus retries log only when the error message changes.
++	openPullRequestsError map[string]string
++
++	// Tracks the most recent per-branch pull-requests fetch error per repo,
++	// so that background retries log only when the error message changes.
++	githubPullRequestsLastError map[string]string
++
++	// Protects openPullRequestsError from concurrent read (UI thread) / write (workers).
++	openPullRequestsErrorMutex sync.Mutex
+ }
+ 
+ func NewRefreshHelper(
+@@ -57,6 +74,10 @@ func NewRefreshHelper(
+ 		mergeConflictsHelper: mergeConflictsHelper,
+ 		worktreeHelper:       worktreeHelper,
+ 		searchHelper:         searchHelper,
++
++		openPullRequestsLoaded:      make(map[string]bool),
++		openPullRequestsError:       make(map[string]string),
++		githubPullRequestsLastError: make(map[string]string),
+ 	}
+ }
+ 
+@@ -807,6 +828,8 @@ func (self *RefreshHelper) refreshGithubPullRequests() {
+ 	if !self.c.Git().GitHub.InGithubRepo(self.c.Model().Remotes) {
+ 		self.c.Model().PullRequests = nil
+ 		self.c.Model().PullRequestsMap = nil
++		self.c.Model().OpenPullRequests = nil
++		self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
+ 		return
+ 	}
+ 
+@@ -814,6 +837,8 @@ func (self *RefreshHelper) refreshGithubPullRequests() {
+ 	if authToken == "" {
+ 		self.c.Model().PullRequests = nil
+ 		self.c.Model().PullRequestsMap = nil
++		self.c.Model().OpenPullRequests = nil
++		self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
+ 		return
+ 	}
+ 
+@@ -822,12 +847,147 @@ func (self *RefreshHelper) refreshGithubPullRequests() {
+ 		if !self.githubBaseRemotePromptDismissed[self.c.Git().RepoPaths.RepoPath()] {
+ 			self.promptForBaseGithubRepo(authToken)
+ 		}
++		if !self.c.UserConfig().Git.PullRequests.Enabled {
++			self.clearOpenPullRequests()
++		}
+ 		return
+ 	}
+ 
+ 	if err := self.setGithubPullRequests(authToken, baseRemote); err != nil {
+-		self.c.LogAction(fmt.Sprintf("Error fetching pull requests from GitHub: %s", err.Error()))
++		if stderrors.Is(err, git_commands.ErrGithubRepoNotFound) {
++			self.handleGithubRepoNotFound()
++		} else {
++			self.logGithubPullRequestsError(err)
++		}
++	} else {
++		delete(self.githubPullRequestsLastError, self.c.Git().RepoPaths.RepoPath())
+ 	}
++
++	if !self.c.UserConfig().Git.PullRequests.Enabled {
++		self.clearOpenPullRequests()
++		return
++	}
++
++	repoPath := self.c.Git().RepoPaths.RepoPath()
++	if !self.openPullRequestsLoaded[repoPath] {
++		err := self.setOpenPullRequests(authToken, baseRemote)
++		if stderrors.Is(err, git_commands.ErrGithubRepoNotFound) {
++			self.handleGithubRepoNotFound()
++		} else {
++			if err != nil {
++				self.c.LogAction(fmt.Sprintf("Error fetching open pull requests from GitHub: %s", err.Error()))
++			}
++			self.recordOpenPullRequestsResult(err)
++		}
++	}
++}
++
++func (self *RefreshHelper) clearOpenPullRequests() {
++	self.c.Model().OpenPullRequests = nil
++	self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
++}
++
++func (self *RefreshHelper) RefreshOpenPullRequests() error {
++	self.c.Mutexes().RefreshingPullRequestsMutex.Lock()
++	defer self.c.Mutexes().RefreshingPullRequestsMutex.Unlock()
++
++	if !self.c.UserConfig().Git.PullRequests.Enabled {
++		self.clearOpenPullRequests()
++		return nil
++	}
++
++	if !self.c.Git().GitHub.InGithubRepo(self.c.Model().Remotes) {
++		self.c.Model().OpenPullRequests = nil
++		self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
++		return nil
++	}
++
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	remote := self.getGithubBaseRemote()
++	if remote == nil {
++		return errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	err := self.setOpenPullRequests(token, remote)
++	if stderrors.Is(err, git_commands.ErrGithubRepoNotFound) {
++		self.handleGithubRepoNotFound()
++		return nil
++	}
++	self.recordOpenPullRequestsResult(err)
++	return err
++}
++
++func (self *RefreshHelper) FetchPullRequestDetails(number int) (*models.GithubPullRequestDetails, error) {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return nil, errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	remote := self.getGithubBaseRemote()
++	if remote == nil {
++		return nil, errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	return self.c.Git().GitHub.FetchPullRequestDetails(remote, number, token)
++}
++
++func (self *RefreshHelper) AddPullRequestComment(nodeID string, body string) error {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	return self.c.Git().GitHub.AddPullRequestComment(nodeID, body, token)
++}
++
++func (self *RefreshHelper) AddPullRequestLineComment(number int, c git_commands.PullRequestLineComment) error {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	remote := self.getGithubBaseRemote()
++	if remote == nil {
++		return errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	return self.c.Git().GitHub.AddPullRequestLineComment(remote, number, c, token)
++}
++
++func (self *RefreshHelper) FetchPullRequestMergeMethods() ([]string, error) {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return nil, errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	remote := self.getGithubBaseRemote()
++	if remote == nil {
++		return nil, errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	return self.c.Git().GitHub.FetchMergeMethods(remote, token)
++}
++
++func (self *RefreshHelper) MergePullRequest(nodeID string, method string) error {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	return self.c.Git().GitHub.MergePullRequest(nodeID, method, token)
++}
++
++func (self *RefreshHelper) SubmitPullRequestReview(nodeID string, event string, body string) error {
++	token := self.c.Git().GitHub.GetAuthToken()
++	if token == "" {
++		return errors.New(self.c.Tr.NoGithubToken)
++	}
++
++	return self.c.Git().GitHub.SubmitPullRequestReview(nodeID, event, body, token)
+ }
+ 
+ func (self *RefreshHelper) getGithubBaseRemote() *models.Remote {
+@@ -857,6 +1017,10 @@ func (self *RefreshHelper) getGithubBaseRemote() *models.Remote {
+ 	return nil
+ }
+ 
++func (self *RefreshHelper) GithubBaseRemote() *models.Remote {
++	return self.getGithubBaseRemote()
++}
++
+ func (self *RefreshHelper) promptForBaseGithubRepo(authToken string) {
+ 	menuItems := lo.FilterMap(self.c.Model().Remotes, func(remote *models.Remote, _ int) (*types.MenuItem, bool) {
+ 		if len(remote.Urls) == 0 {
+@@ -876,7 +1040,28 @@ func (self *RefreshHelper) promptForBaseGithubRepo(authToken string) {
+ 					}
+ 
+ 					if err := self.setGithubPullRequests(authToken, remote); err != nil {
+-						self.c.LogAction(fmt.Sprintf("Error fetching pull requests from GitHub: %s", err.Error()))
++						if stderrors.Is(err, git_commands.ErrGithubRepoNotFound) {
++							self.handleGithubRepoNotFound()
++						} else {
++							self.logGithubPullRequestsError(err)
++						}
++					} else {
++						delete(self.githubPullRequestsLastError, self.c.Git().RepoPaths.RepoPath())
++					}
++
++					if self.c.UserConfig().Git.PullRequests.Enabled {
++						if err := self.setOpenPullRequests(authToken, remote); err != nil {
++							if stderrors.Is(err, git_commands.ErrGithubRepoNotFound) {
++								self.handleGithubRepoNotFound()
++							} else {
++								self.c.LogAction(fmt.Sprintf("Error fetching open pull requests from GitHub: %s", err.Error()))
++								self.recordOpenPullRequestsResult(err)
++							}
++						} else {
++							self.recordOpenPullRequestsResult(nil)
++						}
++					} else {
++						self.clearOpenPullRequests()
+ 					}
+ 					return nil
+ 				})
+@@ -930,6 +1115,21 @@ func (self *RefreshHelper) setGithubPullRequests(authToken string, baseRemote *m
+ 	return nil
+ }
+ 
++func (self *RefreshHelper) setOpenPullRequests(authToken string, baseRemote *models.Remote) error {
++	prs, err := self.c.Git().GitHub.FetchOpenPullRequests(baseRemote, self.c.UserConfig().Git.PullRequests.Filter, authToken)
++	if err != nil {
++		return err
++	}
++
++	self.c.Model().OpenPullRequests = prs
++	if self.openPullRequestsLoaded == nil {
++		self.openPullRequestsLoaded = make(map[string]bool)
++	}
++	self.openPullRequestsLoaded[self.c.Git().RepoPaths.RepoPath()] = true
++	self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
++	return nil
++}
++
+ func (self *RefreshHelper) savePullRequestsToCache(prs []*models.GithubPullRequest) {
+ 	repoPath := self.c.Git().RepoPaths.RepoPath()
+ 	cached := lo.Map(prs, func(pr *models.GithubPullRequest, _ int) config.CachedPullRequest {
+@@ -950,3 +1150,48 @@ func (self *RefreshHelper) savePullRequestsToCache(prs []*models.GithubPullReque
+ 	appState.GithubPullRequests[repoPath] = cached
+ 	self.c.SaveAppStateAndLogError()
+ }
++
++// handleGithubRepoNotFound clears the PR models and marks the repo as loaded
++// with no error, so the PR tab shows its empty state instead of an error.
++func (self *RefreshHelper) handleGithubRepoNotFound() {
++	self.c.Model().PullRequests = nil
++	self.c.Model().PullRequestsMap = nil
++	self.c.Model().OpenPullRequests = nil
++	self.c.PostRefreshUpdate(self.c.Contexts().PullRequests)
++	self.c.PostRefreshUpdate(self.c.Contexts().Branches)
++
++	repoPath := self.c.Git().RepoPaths.RepoPath()
++	self.openPullRequestsLoaded[repoPath] = true
++	self.openPullRequestsErrorMutex.Lock()
++	delete(self.openPullRequestsError, repoPath)
++	self.openPullRequestsErrorMutex.Unlock()
++	delete(self.githubPullRequestsLastError, repoPath)
++}
++
++func (self *RefreshHelper) logGithubPullRequestsError(err error) {
++	repoPath := self.c.Git().RepoPaths.RepoPath()
++	if err.Error() != self.githubPullRequestsLastError[repoPath] {
++		self.c.LogAction(fmt.Sprintf("Error fetching pull requests from GitHub: %s", err.Error()))
++		self.githubPullRequestsLastError[repoPath] = err.Error()
++	}
++}
++
++func (self *RefreshHelper) recordOpenPullRequestsResult(err error) {
++	self.openPullRequestsErrorMutex.Lock()
++	defer self.openPullRequestsErrorMutex.Unlock()
++	repoPath := self.c.Git().RepoPaths.RepoPath()
++	if err != nil {
++		self.openPullRequestsError[repoPath] = err.Error()
++	} else {
++		delete(self.openPullRequestsError, repoPath)
++	}
++	self.openPullRequestsLoaded[repoPath] = true
++}
++
++func (self *RefreshHelper) OpenPullRequestsFailed() bool {
++	repoPath := self.c.Git().RepoPaths.RepoPath()
++	self.openPullRequestsErrorMutex.Lock()
++	_, exists := self.openPullRequestsError[repoPath]
++	self.openPullRequestsErrorMutex.Unlock()
++	return exists
++}
+diff --git a/pkg/gui/controllers/patch_building_controller.go b/pkg/gui/controllers/patch_building_controller.go
+index 4d418d7df..2d5f9d85a 100644
+--- a/pkg/gui/controllers/patch_building_controller.go
++++ b/pkg/gui/controllers/patch_building_controller.go
+@@ -1,9 +1,14 @@
+ package controllers
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 
+ 	"github.com/jesseduffield/gocui"
++	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
++	"github.com/jesseduffield/lazygit/pkg/commands/models"
++	"github.com/jesseduffield/lazygit/pkg/commands/patch"
++	"github.com/jesseduffield/lazygit/pkg/gui/context"
+ 	"github.com/jesseduffield/lazygit/pkg/gui/keybindings"
+ 	"github.com/jesseduffield/lazygit/pkg/gui/types"
+ 	"github.com/samber/lo"
+@@ -60,9 +65,40 @@ func (self *PatchBuildingController) GetKeybindings(opts types.KeybindingsOpts)
+ 			DescriptionFunc: self.EscapeDescription,
+ 			DisplayOnScreen: true,
+ 		},
++		{
++			Key:               opts.GetKey(opts.Config.Files.CommitChanges),
++			Handler:           self.commentOnLines,
++			GetDisabledReason: self.getDisabledReasonForLineComment,
++			Description:       self.c.Tr.AddPullRequestLineComment,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Files.CommitChangesWithEditor),
++			Handler:           self.commentOnLinesInEditor,
++			GetDisabledReason: self.getDisabledReasonForLineComment,
++			Description:       self.c.Tr.AddPullRequestLineCommentInEditor,
++			DisplayOnScreen:   false,
++		},
+ 	}
+ }
+ 
++// lineCommentRange maps a selected patch line range to the GitHub PR line
++// comment parameters. It fails if the range contains lines that have no
++// position in the new file (deletions, headers, etc).
++func lineCommentRange(lines []*patch.PatchLine, start, end int, lineNumber func(int) int) (startLine int, line int, ok bool) {
++	for i := start; i <= end; i++ {
++		kind := lines[i].Kind
++		if kind != patch.ADDITION && kind != patch.CONTEXT {
++			return 0, 0, false
++		}
++	}
++	line = lineNumber(end)
++	if start < end {
++		startLine = lineNumber(start)
++	}
++	return startLine, line, true
++}
++
+ func (self *PatchBuildingController) Context() types.Context {
+ 	return self.c.Contexts().CustomPatchBuilder
+ }
+@@ -194,6 +230,94 @@ func (self *PatchBuildingController) getDisabledReasonForDiscard() *types.Disabl
+ 	return nil
+ }
+ 
++func (self *PatchBuildingController) pullRequestForLineComment() *models.GithubPullRequestRef {
++	parent := self.c.Contexts().CommitFiles.GetParentContext()
++	if parent == nil || parent.GetKey() != context.SUB_COMMITS_CONTEXT_KEY {
++		return nil
++	}
++	if ref, ok := self.c.Contexts().SubCommits.GetRef().(*models.GithubPullRequestRef); ok {
++		return ref
++	}
++	return nil
++}
++
++func (self *PatchBuildingController) getDisabledReasonForLineComment() *types.DisabledReason {
++	if self.pullRequestForLineComment() == nil {
++		return &types.DisabledReason{Text: self.c.Tr.PRLineCommentOnlyInPRTab}
++	}
++	return nil
++}
++
++// lineCommentSend captures the selected line range and returns a send closure.
++func (self *PatchBuildingController) lineCommentSend() (func(string) error, error) {
++	pr := self.pullRequestForLineComment()
++	if pr == nil {
++		return nil, nil
++	}
++
++	self.context().GetMutex().Lock()
++	state := self.context().GetState()
++	var startLine, line int
++	var ok bool
++	var path, commit string
++	if state != nil {
++		start, end := state.SelectedPatchRange()
++		startLine, line, ok = lineCommentRange(state.PatchLines(), start, end, state.LineNumberOfPatchLine)
++		path = self.c.Contexts().CommitFiles.GetSelectedPath()
++		commit = self.c.Contexts().CommitFiles.GetRef().RefName()
++	}
++	self.context().GetMutex().Unlock()
++
++	if state == nil {
++		return nil, nil
++	}
++	if !ok {
++		return nil, errors.New(self.c.Tr.PRLineCommentDeletedLines)
++	}
++
++	return func(text string) error {
++		return self.c.WithWaitingStatus(self.c.Tr.SendingPullRequestComment, func(gocui.Task) error {
++			if err := self.c.Helpers().Refresh.AddPullRequestLineComment(pr.Number, git_commands.PullRequestLineComment{
++				CommitID:  commit,
++				Path:      path,
++				Body:      text,
++				Line:      line,
++				StartLine: startLine,
++			}); err != nil {
++				return err
++			}
++			self.c.Toast(self.c.Tr.PullRequestCommentSent)
++			return nil
++		})
++	}, nil
++}
++
++func (self *PatchBuildingController) commentOnLines() error {
++	send, err := self.lineCommentSend()
++	if err != nil {
++		return err
++	}
++	if send == nil {
++		return nil
++	}
++	return openCommentPanel(self.c, self.c.Tr.AddPullRequestLineComment, send)
++}
++
++func (self *PatchBuildingController) commentOnLinesInEditor() error {
++	send, err := self.lineCommentSend()
++	if err != nil {
++		return err
++	}
++	if send == nil {
++		return nil
++	}
++	path, err := newCommentFile(self.c)
++	if err != nil {
++		return err
++	}
++	return commentInEditor(self.c, path, send)
++}
++
+ func (self *PatchBuildingController) discardSelection() error {
+ 	prompt := lo.Ternary(self.c.Git().Patch.PatchBuilder.IsEmpty(),
+ 		self.c.Tr.DiscardLinesFromCommitPrompt,
+diff --git a/pkg/gui/controllers/pull_requests_controller.go b/pkg/gui/controllers/pull_requests_controller.go
+new file mode 100644
+index 000000000..dfa21ec98
+--- /dev/null
++++ b/pkg/gui/controllers/pull_requests_controller.go
+@@ -0,0 +1,543 @@
++package controllers
++
++import (
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/go-errors/errors"
++	"github.com/jesseduffield/gocui"
++	"github.com/jesseduffield/lazygit/pkg/commands/git_commands"
++	"github.com/jesseduffield/lazygit/pkg/commands/models"
++	"github.com/jesseduffield/lazygit/pkg/gui/context"
++	"github.com/jesseduffield/lazygit/pkg/gui/controllers/helpers"
++	"github.com/jesseduffield/lazygit/pkg/gui/presentation"
++	"github.com/jesseduffield/lazygit/pkg/gui/types"
++	"github.com/samber/lo"
++)
++
++type PullRequestsController struct {
++	baseController
++	*ListControllerTrait[*models.GithubPullRequest]
++	c               *ControllerCommon
++	loadingDetails  map[int]bool
++	renderedDetails map[int]string
++}
++
++var _ types.IController = &PullRequestsController{}
++
++func NewPullRequestsController(
++	c *ControllerCommon,
++) *PullRequestsController {
++	return &PullRequestsController{
++		baseController: baseController{},
++		ListControllerTrait: NewListControllerTrait(
++			c,
++			c.Contexts().PullRequests,
++			c.Contexts().PullRequests.GetSelected,
++			c.Contexts().PullRequests.GetSelectedItems,
++		),
++		c:               c,
++		loadingDetails:  map[int]bool{},
++		renderedDetails: map[int]string{},
++	}
++}
++
++func (self *PullRequestsController) GetKeybindings(opts types.KeybindingsOpts) []*types.Binding {
++	bindings := []*types.Binding{
++		{
++			Key: opts.GetKey(opts.Config.Branches.FastForward),
++			Handler: func() error {
++				self.c.WithWaitingStatus(self.c.Tr.FetchingPullRequests, func(gocui.Task) error {
++					return self.c.Helpers().Refresh.RefreshOpenPullRequests()
++				})
++				return nil
++			},
++			Description:     self.c.Tr.RefreshPullRequests,
++			DisplayOnScreen: true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Universal.Select),
++			Handler:           self.withItem(self.checkout),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.CheckoutPullRequest,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Universal.GoInto),
++			Handler:           self.withItem(self.viewCommits),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.ViewCommits,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Branches.OpenPullRequestInBrowser),
++			Handler:           self.withItem(self.openInBrowser),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.OpenPullRequestInBrowser,
++			DisplayOnScreen:   false,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Universal.Edit),
++			Handler:           self.withItem(self.openInEditor),
++			GetDisabledReason: self.require(self.singleItemSelected(self.detailsLoaded)),
++			Description:       self.c.Tr.OpenPullRequestInEditor,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Universal.Pull),
++			Handler:           self.withItem(self.refreshDetails),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.RefreshPullRequest,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Files.CommitChanges),
++			Handler:           self.withItem(self.addComment),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.AddPullRequestComment,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Files.CommitChangesWithEditor),
++			Handler:           self.withItem(self.addCommentInEditor),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.AddPullRequestCommentInEditor,
++			DisplayOnScreen:   false,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Files.ToggleStagedAll),
++			Handler:           self.withItem(self.review),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.ReviewPullRequest,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Universal.CreateRebaseOptionsMenu),
++			Handler:           self.withItem(self.merge),
++			GetDisabledReason: self.require(self.singleItemSelected(self.canMerge)),
++			Description:       self.c.Tr.MergePullRequest,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Branches.CreatePullRequest),
++			Handler:           self.withItem(self.confirmOpenInBrowser),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.OpenPullRequestInBrowser,
++			DisplayOnScreen:   true,
++		},
++		{
++			Key:               opts.GetKey(opts.Config.Branches.CopyPullRequestURL),
++			Handler:           self.withItem(self.copyURL),
++			GetDisabledReason: self.require(self.singleItemSelected()),
++			Description:       self.c.Tr.CopyPullRequestURL,
++			DisplayOnScreen:   true,
++		},
++	}
++
++	return bindings
++}
++
++func (self *PullRequestsController) GetOnRenderToMain() func() {
++	return func() {
++		var task types.UpdateTask
++		pr := self.context().GetSelected()
++		if pr == nil {
++			task = types.NewRenderStringTask(self.c.Tr.NoPullRequests)
++		} else {
++			if r := self.renderedDetails[pr.Number]; r != "" {
++				task = types.NewRenderStringTask(r)
++			} else if d := self.c.Model().PullRequestDetails[pr.Number]; d != nil {
++				task = types.NewRenderStringTask(presentation.FormatPullRequestDetails(d))
++			} else {
++				text := strings.Join([]string{
++					fmt.Sprintf("#%d %s", pr.Number, pr.Title),
++					"",
++					fmt.Sprintf("State: %s", pr.State),
++					fmt.Sprintf("Author: %s", pr.Author),
++					fmt.Sprintf("Branch: %s:%s", pr.HeadRepositoryOwner.Login, pr.HeadRefName),
++					fmt.Sprintf("URL: %s", pr.Url),
++				}, "\n")
++				text += "\n\n" + self.c.Tr.LoadingPullRequestDetails
++				task = types.NewRenderStringTask(text)
++				self.loadDetails(pr.Number)
++			}
++		}
++
++		self.c.RenderToMainViews(types.RefreshMainOpts{
++			Pair: self.c.MainViewPairs().Normal,
++			Main: &types.ViewUpdateOpts{
++				Title: self.c.Tr.PullRequestTitle,
++				Task:  task,
++			},
++		})
++	}
++}
++
++func (self *PullRequestsController) GetOnFocus() func(types.OnFocusOpts) {
++	return func(opts types.OnFocusOpts) {
++		if !self.c.UserConfig().Git.PullRequests.Enabled {
++			return
++		}
++		if !self.c.Helpers().Refresh.OpenPullRequestsFailed() {
++			return
++		}
++		self.c.OnWorker(func(gocui.Task) error {
++			err := self.c.Helpers().Refresh.RefreshOpenPullRequests()
++			if err != nil {
++				self.c.LogAction(fmt.Sprintf("Error fetching open pull requests from GitHub: %s", err.Error()))
++			}
++			return nil
++		})
++	}
++}
++
++func (self *PullRequestsController) renderDetails(d *models.GithubPullRequestDetails, width int) string {
++	if _, err := exec.LookPath("glow"); err != nil {
++		return ""
++	}
++	args := []string{"glow", "-s", self.c.UserConfig().Git.PullRequests.Style, "-w", strconv.Itoa(max(width, 40)), "-"}
++	out, err := self.c.OS().Cmd.New(args).SetStdin(presentation.FormatPullRequestDetailsMarkdown(d)).AddEnvVars("CLICOLOR_FORCE=1").DontLog().RunWithOutput()
++	if err != nil {
++		return ""
++	}
++	return out
++}
++
++func (self *PullRequestsController) loadDetails(number int) {
++	if self.loadingDetails[number] {
++		return
++	}
++	self.loadingDetails[number] = true
++
++	width := self.c.Views().Main.InnerWidth()
++
++	self.c.OnWorker(func(gocui.Task) error {
++		d, err := self.c.Helpers().Refresh.FetchPullRequestDetails(number)
++		var rendered string
++		if err == nil {
++			rendered = self.renderDetails(d, width)
++		}
++		self.c.OnUIThread(func() error {
++			delete(self.loadingDetails, number)
++			if err != nil {
++				self.c.ErrorToast(err.Error())
++				return nil
++			}
++			if self.c.Model().PullRequestDetails == nil {
++				self.c.Model().PullRequestDetails = map[int]*models.GithubPullRequestDetails{}
++			}
++			self.c.Model().PullRequestDetails[number] = d
++			if rendered != "" {
++				self.renderedDetails[number] = rendered
++			}
++			if sel := self.context().GetSelected(); sel != nil && sel.Number == number {
++				self.context().HandleRenderToMain()
++			}
++			return nil
++		})
++		return nil
++	})
++}
++
++func (self *PullRequestsController) refreshDetails(pr *models.GithubPullRequest) error {
++	delete(self.c.Model().PullRequestDetails, pr.Number)
++	delete(self.renderedDetails, pr.Number)
++	self.context().HandleRenderToMain()
++	return nil
++}
++
++func (self *PullRequestsController) afterMutation(pr *models.GithubPullRequest, toast string) {
++	self.c.OnUIThread(func() error {
++		self.c.Toast(toast)
++		return self.refreshDetails(pr)
++	})
++}
++
++func (self *PullRequestsController) addComment(pr *models.GithubPullRequest) error {
++	return openCommentPanel(self.c, self.c.Tr.AddPullRequestComment, func(text string) error {
++		return self.sendComment(pr, text)
++	})
++}
++
++func (self *PullRequestsController) addCommentInEditor(pr *models.GithubPullRequest) error {
++	path, err := newCommentFile(self.c)
++	if err != nil {
++		return err
++	}
++	return commentInEditor(self.c, path, func(text string) error {
++		return self.sendComment(pr, text)
++	})
++}
++
++func (self *PullRequestsController) sendComment(pr *models.GithubPullRequest, text string) error {
++	return self.c.WithWaitingStatus(self.c.Tr.SendingPullRequestComment, func(gocui.Task) error {
++		if err := self.c.Helpers().Refresh.AddPullRequestComment(pr.NodeID, text); err != nil {
++			return err
++		}
++		self.afterMutation(pr, self.c.Tr.PullRequestCommentSent)
++		return nil
++	})
++}
++
++// openCommentPanel reuses the commit message panel for a multiline comment.
++func openCommentPanel(c *ControllerCommon, title string, send func(body string) error) error {
++	c.Helpers().Commits.OpenCommitMessagePanel(&helpers.OpenCommitMessagePanelOpts{
++		CommitIndex:      context.NoCommitIndex,
++		SummaryTitle:     title,
++		DescriptionTitle: c.Tr.PullRequestCommentBodyTitle,
++		PreserveMessage:  false,
++		OnConfirm: func(summary string, description string) error {
++			if c.UserConfig().Git.Commit.AutoWrapCommitMessage {
++				description = helpers.TryRemoveHardLineBreaks(description, c.UserConfig().Git.Commit.AutoWrapWidth)
++			}
++			body := summary
++			if description != "" {
++				body = summary + "\n\n" + description
++			}
++			return send(body)
++		},
++		OnSwitchToEditor: func(path string) error {
++			return commentInEditor(c, path, send)
++		},
++	})
++	return nil
++}
++
++// commentInEditor edits the file in $EDITOR and sends its content.
++func commentInEditor(c *ControllerCommon, path string, send func(body string) error) error {
++	if err := c.Helpers().Files.EditFileAtLineAndWait(path, 1); err != nil {
++		return err
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return err
++	}
++	_ = os.Remove(path)
++	text := strings.TrimSpace(string(data))
++	if text == "" {
++		return nil
++	}
++	return send(text)
++}
++
++func newCommentFile(c *ControllerCommon) (string, error) {
++	path := filepath.Join(c.OS().GetTempDir(), c.Git().RepoPaths.RepoName(), "pr-comment-"+time.Now().Format("20060102-150405.000000000")+".md")
++	return path, c.OS().CreateFileWithContent(path, "")
++}
++
++func (self *PullRequestsController) review(pr *models.GithubPullRequest) error {
++	return self.c.Menu(types.CreateMenuOptions{
++		Title: self.c.Tr.ReviewPullRequest,
++		Items: []*types.MenuItem{
++			{
++				Label: self.c.Tr.ApprovePullRequest,
++				OnPress: func() error {
++					self.c.Confirm(types.ConfirmOpts{
++						Title:  self.c.Tr.ReviewPullRequest,
++						Prompt: fmt.Sprintf(self.c.Tr.ConfirmApprovePullRequest, pr.Number),
++						HandleConfirm: func() error {
++							return self.submitReview(pr, "APPROVE", "")
++						},
++					})
++					return nil
++				},
++			},
++			{
++				Label: self.c.Tr.RequestChangesPullRequest,
++				OnPress: func() error {
++					self.c.Prompt(types.PromptOpts{
++						Title: self.c.Tr.RequestChangesBody,
++						HandleConfirm: func(text string) error {
++							if strings.TrimSpace(text) == "" {
++								return errors.New(self.c.Tr.RequestChangesBody)
++							}
++							return self.submitReview(pr, "REQUEST_CHANGES", text)
++						},
++					})
++					return nil
++				},
++			},
++		},
++	})
++}
++
++func (self *PullRequestsController) canMerge(pr *models.GithubPullRequest) *types.DisabledReason {
++	if pr.State != "OPEN" {
++		return &types.DisabledReason{Text: self.c.Tr.PullRequestNotOpen}
++	}
++	return nil
++}
++
++func (self *PullRequestsController) merge(pr *models.GithubPullRequest) error {
++	self.c.WithWaitingStatus(self.c.Tr.FetchingMergeMethods, func(gocui.Task) error {
++		methods, err := self.c.Helpers().Refresh.FetchPullRequestMergeMethods()
++		if err != nil {
++			return err
++		}
++		self.c.OnUIThread(func() error {
++			labels := map[string]string{
++				"MERGE":  self.c.Tr.MergeCommitMethod,
++				"SQUASH": self.c.Tr.SquashMergeMethod,
++				"REBASE": self.c.Tr.RebaseMergeMethod,
++			}
++			items := make([]*types.MenuItem, 0, len(methods))
++			for _, method := range methods {
++				label := labels[method]
++				items = append(items, &types.MenuItem{
++					Label: label,
++					OnPress: func() error {
++						self.c.Confirm(types.ConfirmOpts{
++							Title:  self.c.Tr.MergePullRequest,
++							Prompt: fmt.Sprintf(self.c.Tr.ConfirmMergePullRequest, pr.Number, label),
++							HandleConfirm: func() error {
++								return self.submitMerge(pr, method)
++							},
++						})
++						return nil
++					},
++				})
++			}
++			return self.c.Menu(types.CreateMenuOptions{
++				Title: self.c.Tr.MergePullRequest,
++				Items: items,
++			})
++		})
++		return nil
++	})
++	return nil
++}
++
++func (self *PullRequestsController) submitMerge(pr *models.GithubPullRequest, method string) error {
++	return self.c.WithWaitingStatus(self.c.Tr.MergingPullRequest, func(gocui.Task) error {
++		if err := self.c.Helpers().Refresh.MergePullRequest(pr.NodeID, method); err != nil {
++			return err
++		}
++		self.afterMutation(pr, self.c.Tr.PullRequestMerged)
++		return self.c.Helpers().Refresh.RefreshOpenPullRequests()
++	})
++}
++
++func (self *PullRequestsController) viewCommits(pr *models.GithubPullRequest) error {
++	remote := self.c.Helpers().Refresh.GithubBaseRemote()
++	if remote == nil {
++		return errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	ref := &models.GithubPullRequestRef{Number: pr.Number, Title: pr.Title}
++
++	return self.c.WithWaitingStatus(self.c.Tr.FetchingPullRequest, func(task gocui.Task) error {
++		if err := self.c.Git().GitHub.FetchPullRequestRefCmdObj(task, remote.Name, pr.Number).Run(); err != nil {
++			return err
++		}
++
++		self.c.OnUIThread(func() error {
++			return self.c.Helpers().SubCommits.ViewSubCommits(helpers.ViewSubCommitsOpts{
++				Ref:             ref,
++				TitleRef:        ref.RefName() + " " + pr.Title,
++				Context:         self.context(),
++				ShowBranchHeads: true,
++			})
++		})
++		return nil
++	})
++}
++
++func (self *PullRequestsController) submitReview(pr *models.GithubPullRequest, event string, body string) error {
++	return self.c.WithWaitingStatus(self.c.Tr.SubmittingPullRequestReview, func(gocui.Task) error {
++		if err := self.c.Helpers().Refresh.SubmitPullRequestReview(pr.NodeID, event, body); err != nil {
++			return err
++		}
++		self.afterMutation(pr, self.c.Tr.PullRequestReviewSubmitted)
++		return nil
++	})
++}
++
++func (self *PullRequestsController) confirmOpenInBrowser(pr *models.GithubPullRequest) error {
++	self.c.Confirm(types.ConfirmOpts{
++		Title:  self.c.Tr.OpenPullRequestInBrowser,
++		Prompt: fmt.Sprintf(self.c.Tr.ConfirmOpenPullRequest, pr.Number),
++		HandleConfirm: func() error {
++			return self.openInBrowser(pr)
++		},
++	})
++	return nil
++}
++
++func (self *PullRequestsController) checkout(pr *models.GithubPullRequest) error {
++	remote := self.c.Helpers().Refresh.GithubBaseRemote()
++	if remote == nil {
++		return errors.New(self.c.Tr.NoGithubBaseRemote)
++	}
++
++	owner, _, err := self.c.Git().GitHub.GetBaseRepoOwnerAndName(remote)
++	if err != nil {
++		return err
++	}
++
++	name := git_commands.PullRequestLocalBranchName(pr, owner)
++
++	if lo.ContainsBy(self.c.Model().Branches, func(branch *models.Branch) bool {
++		return branch.Name == name
++	}) {
++		return self.c.Helpers().Refs.CheckoutRef(name, types.CheckoutRefOptions{})
++	}
++
++	self.c.WithWaitingStatus(self.c.Tr.FetchingPullRequest, func(task gocui.Task) error {
++		self.c.LogAction(self.c.Tr.Actions.CheckoutPullRequest)
++
++		if err := self.c.Git().GitHub.FetchPullRequestCmdObj(task, remote.Name, pr.Number, name).Run(); err != nil {
++			return err
++		}
++
++		// CheckoutRef pushes the branches context, so it must run on the UI thread.
++		self.c.OnUIThread(func() error {
++			return self.c.Helpers().Refs.CheckoutRef(name, types.CheckoutRefOptions{})
++		})
++		return nil
++	})
++
++	return nil
++}
++
++func (self *PullRequestsController) openInBrowser(pr *models.GithubPullRequest) error {
++	self.c.LogAction(self.c.Tr.Actions.OpenPullRequest)
++
++	return self.c.OS().OpenLink(pr.Url)
++}
++
++func (self *PullRequestsController) detailsLoaded(pr *models.GithubPullRequest) *types.DisabledReason {
++	if self.c.Model().PullRequestDetails[pr.Number] == nil {
++		return &types.DisabledReason{Text: self.c.Tr.LoadingPullRequestDetails}
++	}
++	return nil
++}
++
++// openInEditor writes the details to lazygit's temp dir, which is removed on exit.
++func (self *PullRequestsController) openInEditor(pr *models.GithubPullRequest) error {
++	d := self.c.Model().PullRequestDetails[pr.Number]
++	path := filepath.Join(self.c.OS().GetTempDir(), self.c.Git().RepoPaths.RepoName(), fmt.Sprintf("pr-%d.md", pr.Number))
++	if err := self.c.OS().CreateFileWithContent(path, presentation.FormatPullRequestDetailsMarkdown(d)); err != nil {
++		return err
++	}
++	return self.c.Helpers().Files.EditFiles([]string{path})
++}
++
++func (self *PullRequestsController) copyURL(pr *models.GithubPullRequest) error {
++	self.c.LogAction(self.c.Tr.Actions.CopyPullRequestURL)
++	if err := self.c.OS().CopyToClipboard(pr.Url); err != nil {
++		return err
++	}
++
++	self.c.Toast(self.c.Tr.PullRequestURLCopiedToClipboard)
++
++	return nil
++}
++
++func (self *PullRequestsController) context() *context.PullRequestsContext {
++	return self.c.Contexts().PullRequests
++}
+diff --git a/pkg/gui/gui.go b/pkg/gui/gui.go
+index 3f62bfbc7..b1c6e7198 100644
+--- a/pkg/gui/gui.go
++++ b/pkg/gui/gui.go
+@@ -832,6 +832,10 @@ func (gui *Gui) viewTabMap() map[string][]context.TabView {
+ 				Tab:      gui.c.Tr.LocalBranchesTitle,
+ 				ViewName: "localBranches",
+ 			},
++			{
++				Tab:      gui.c.Tr.PullRequestsTitle,
++				ViewName: "pullRequests",
++			},
+ 			{
+ 				Tab:      gui.c.Tr.RemotesTitle,
+ 				ViewName: "remotes",
+diff --git a/pkg/gui/patch_exploring/state.go b/pkg/gui/patch_exploring/state.go
+index aab024ec4..b20dadca2 100644
+--- a/pkg/gui/patch_exploring/state.go
++++ b/pkg/gui/patch_exploring/state.go
+@@ -372,6 +372,14 @@ func (s *State) SelectedPatchRange() (int, int) {
+ 	return s.patchLineIndices[start], s.patchLineIndices[end]
+ }
+ 
++func (s *State) PatchLines() []*patch.PatchLine {
++	return s.patch.Lines()
++}
++
++func (s *State) LineNumberOfPatchLine(idx int) int {
++	return s.patch.LineNumberOfLine(idx)
++}
++
+ // Returns the line indices of the selected patch range that are changes (i.e. additions or deletions)
+ func (s *State) LineIndicesOfAddedOrDeletedLinesInSelectedPatchRange() []int {
+ 	viewStart, viewEnd := s.SelectedViewRange()
+diff --git a/pkg/gui/presentation/icons/git_icons.go b/pkg/gui/presentation/icons/git_icons.go
+index af292b380..a524a5637 100644
+--- a/pkg/gui/presentation/icons/git_icons.go
++++ b/pkg/gui/presentation/icons/git_icons.go
+@@ -14,6 +14,7 @@ var (
+ 	MERGE_COMMIT_ICON            = "\U000f062d" // 󰘭
+ 	DEFAULT_REMOTE_ICON          = "\U000f02a2" // 󰊢
+ 	STASH_ICON                   = "\uf01c"     // 
++	GITHUB_ICON                  = "\ue709"     // 
+ 	LINKED_WORKTREE_ICON         = "\U000f0339" // 󰌹
+ 	MISSING_LINKED_WORKTREE_ICON = "\U000f033a" // 󰌺
+ )
+diff --git a/pkg/gui/presentation/pull_requests.go b/pkg/gui/presentation/pull_requests.go
+new file mode 100644
+index 000000000..fd03f7d5b
+--- /dev/null
++++ b/pkg/gui/presentation/pull_requests.go
+@@ -0,0 +1,252 @@
++package presentation
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++
++	"github.com/jesseduffield/lazygit/pkg/commands/models"
++	"github.com/jesseduffield/lazygit/pkg/gui/presentation/icons"
++	"github.com/jesseduffield/lazygit/pkg/gui/style"
++	"github.com/jesseduffield/lazygit/pkg/theme"
++	"github.com/samber/lo"
++)
++
++func GetPullRequestListDisplayStrings(prs []*models.GithubPullRequest) [][]string {
++	return lo.Map(prs, func(pr *models.GithubPullRequest, _ int) []string {
++		headBranch := pr.HeadRefName
++		if pr.HeadRepositoryOwner.Login != pr.Author {
++			headBranch = pr.HeadRepositoryOwner.Login + ":" + headBranch
++		}
++		color := prRowColor(pr)
++		icon := lo.Ternary(icons.IsIconEnabled(), icons.GITHUB_ICON, "#")
++		title := pr.Title + " (#" + pr.ID() + ")"
++		// Drafts are grayed out on the whole row
++		if pr.State == "DRAFT" {
++			return []string{color.Sprint(icon), color.Sprint(title), color.Sprint(pr.Author), color.Sprint(headBranch)}
++		}
++		return []string{
++			color.Sprint(icon),
++			theme.DefaultTextColor.Sprint(title),
++			style.FgCyan.Sprint(pr.Author),
++			style.FgYellow.Sprint(headBranch),
++		}
++	})
++}
++
++func prRowColor(pr *models.GithubPullRequest) style.TextStyle {
++	switch {
++	case pr.State == "DRAFT":
++		return style.FgBlackLighter
++	case pr.ChecksState == "FAILURE" || pr.ChecksState == "ERROR":
++		return style.FgRed
++	case pr.ReviewDecision == "APPROVED":
++		return style.FgGreen
++	case pr.AssignedToMe:
++		return style.FgYellow
++	default:
++		return theme.DefaultTextColor
++	}
++}
++
++func prStatusColor(status string) style.TextStyle {
++	switch status {
++	case "SUCCESS", "APPROVED":
++		return style.FgGreen
++	case "FAILURE", "ERROR", "CHANGES_REQUESTED", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED":
++		return style.FgRed
++	case "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "REVIEW_REQUIRED", "WAITING":
++		return style.FgYellow
++	default:
++		return style.FgDefault
++	}
++}
++
++func prStatusIcon(status string) string {
++	switch status {
++	case "SUCCESS", "APPROVED":
++		return "✅"
++	case "FAILURE", "ERROR", "CHANGES_REQUESTED", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED":
++		return "❌"
++	case "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "REVIEW_REQUIRED", "WAITING":
++		return "⏳"
++	default:
++		return ""
++	}
++}
++
++func mdStatus(status string) string {
++	icon := prStatusIcon(status)
++	if icon == "" {
++		return status
++	}
++	return icon + " " + status
++}
++
++func mdTableCell(s string) string {
++	s = strings.ReplaceAll(s, "|", "\\|")
++	return strings.ReplaceAll(s, "\n", " ")
++}
++
++func FormatPullRequestDetailsMarkdown(d *models.GithubPullRequestDetails) string {
++	sections := []string{
++		fmt.Sprintf("# #%d %s", d.Number, d.Title),
++		fmt.Sprintf("**State:** %s · **Author:** @%s\n%s", d.State, d.Author, d.Url),
++	}
++
++	review := "NONE"
++	if d.ReviewDecision != "" {
++		review = mdStatus(d.ReviewDecision)
++	}
++	reviewSection := "## Review: " + review
++	if len(d.Reviewers) == 0 {
++		reviewSection += "\n\n_No reviewers_"
++	} else {
++		lines := []string{"| Reviewer | State |", "|---|---|"}
++		for _, r := range d.Reviewers {
++			lines = append(lines, fmt.Sprintf("| @%s | %s |", mdTableCell(r.Login), mdTableCell(mdStatus(r.State))))
++		}
++		reviewSection += "\n\n" + strings.Join(lines, "\n")
++	}
++	sections = append(sections, reviewSection)
++
++	checks := "NONE"
++	if d.ChecksState != "" {
++		checks = mdStatus(d.ChecksState)
++	}
++	checksSection := "## Checks: " + checks
++	if len(d.Checks) == 0 {
++		checksSection += "\n\n_No checks_"
++	} else {
++		lines := []string{"| Check | Status |", "|---|---|"}
++		for _, c := range d.Checks {
++			lines = append(lines, fmt.Sprintf("| %s | %s |", mdTableCell(c.Name), mdTableCell(mdStatus(c.Status))))
++		}
++		checksSection += "\n\n" + strings.Join(lines, "\n")
++	}
++	sections = append(sections, checksSection)
++
++	body := strings.ReplaceAll(d.Body, "\r\n", "\n")
++	description := "## Description"
++	if body == "" {
++		description += "\n\n_No description_"
++	} else {
++		description += "\n\n" + body
++	}
++	sections = append(sections, description)
++
++	comments := fmt.Sprintf("## Comments (%d)", len(d.Comments))
++	if len(d.Comments) == 0 {
++		comments += "\n\n_No comments_"
++	} else {
++		blocks := make([]string, 0, len(d.Comments))
++		for _, c := range d.Comments {
++			heading := fmt.Sprintf("### @%s · %s", c.Author, c.CreatedAt.Format("2006-01-02 15:04"))
++			if c.ReviewState != "" {
++				heading += " · " + mdStatus(c.ReviewState)
++			}
++			if c.Path != "" {
++				heading += " · `" + c.Path + "`"
++			}
++			if c.Resolved {
++				commentsCount := fmt.Sprintf("%d comments", c.ThreadSize)
++				if c.ThreadSize == 1 {
++					commentsCount = "1 comment"
++				}
++				blocks = append(blocks, heading+" · ✔ Resolved ("+commentsCount+")")
++			} else if c.Hidden != "" {
++				blocks = append(blocks, heading+" · Hidden: "+c.Hidden)
++			} else {
++				cBody := strings.ReplaceAll(c.Body, "\r\n", "\n")
++				if cBody == "" {
++					cBody = "_No text_"
++				}
++				blocks = append(blocks, heading+"\n\n"+cBody)
++			}
++		}
++		comments += "\n\n" + strings.Join(blocks, "\n\n---\n\n")
++	}
++	sections = append(sections, comments)
++
++	return strings.Join(sections, "\n\n")
++}
++
++func FormatPullRequestDetails(d *models.GithubPullRequestDetails) string {
++	lines := []string{
++		style.AttrBold.Sprint("#" + strconv.Itoa(d.Number) + " " + d.Title),
++		"State: " + prColor(d.State).Sprint(d.State) + "   " + style.FgCyan.Sprint("Author: "+d.Author),
++		"URL: " + d.Url,
++		"",
++	}
++
++	review := "NONE"
++	if d.ReviewDecision != "" {
++		review = prStatusColor(d.ReviewDecision).Sprint(d.ReviewDecision)
++	}
++	lines = append(lines, "Review: "+review, "Reviewers:")
++	if len(d.Reviewers) == 0 {
++		lines = append(lines, "  none")
++	} else {
++		for _, r := range d.Reviewers {
++			lines = append(lines, "  "+r.Login+"  "+prStatusColor(r.State).Sprint(r.State))
++		}
++	}
++	lines = append(lines, "")
++
++	checks := "NONE"
++	if d.ChecksState != "" {
++		checks = prStatusColor(d.ChecksState).Sprint(d.ChecksState)
++	}
++	lines = append(lines, "Checks: "+checks)
++	for _, c := range d.Checks {
++		lines = append(lines, "  "+c.Name+"  "+prStatusColor(c.Status).Sprint(c.Status))
++	}
++	lines = append(lines, "")
++
++	lines = append(lines, "Description:")
++	body := strings.ReplaceAll(d.Body, "\r\n", "\n")
++	if body == "" {
++		lines = append(lines, "  (no description)")
++	} else {
++		for _, l := range strings.Split(body, "\n") {
++			lines = append(lines, "  "+l)
++		}
++	}
++	lines = append(lines, "")
++
++	lines = append(lines, fmt.Sprintf("Comments (%d):", len(d.Comments)))
++	if len(d.Comments) == 0 {
++		lines = append(lines, "  none")
++	} else {
++		for i, c := range d.Comments {
++			header := "  " + style.FgCyan.Sprint(c.Author) + " · " + c.CreatedAt.Format("2006-01-02 15:04")
++			if c.ReviewState != "" {
++				header += " · " + prStatusColor(c.ReviewState).Sprint(c.ReviewState)
++			}
++			if c.Path != "" {
++				header += " · " + style.FgYellow.Sprint(c.Path)
++			}
++			if c.Resolved {
++				commentsCount := fmt.Sprintf("%d comments", c.ThreadSize)
++				if c.ThreadSize == 1 {
++					commentsCount = "1 comment"
++				}
++				lines = append(lines, header+" · "+style.FgGreen.Sprint("Resolved ("+commentsCount+")"))
++			} else if c.Hidden != "" {
++				lines = append(lines, header+" · "+style.FgBlackLighter.Sprint("Hidden: "+c.Hidden))
++			} else {
++				lines = append(lines, header)
++				cBody := strings.ReplaceAll(c.Body, "\r\n", "\n")
++				if cBody != "" {
++					for _, l := range strings.Split(cBody, "\n") {
++						lines = append(lines, "    "+l)
++					}
++				}
++			}
++			if i < len(d.Comments)-1 {
++				lines = append(lines, "")
++			}
++		}
++	}
++	return strings.Join(lines, "\n")
++}
+diff --git a/pkg/gui/types/common.go b/pkg/gui/types/common.go
+index 06c459add..a498cbba7 100644
+--- a/pkg/gui/types/common.go
++++ b/pkg/gui/types/common.go
+@@ -300,6 +300,10 @@ type Model struct {
+ 	PullRequests    []*models.GithubPullRequest
+ 	PullRequestsMap map[string]*models.GithubPullRequest
+ 
++	// Open PRs of the base repo, shown in the pull requests tab
++	OpenPullRequests   []*models.GithubPullRequest
++	PullRequestDetails map[int]*models.GithubPullRequestDetails // Cached per PR number; filled lazily when a PR is selected
++
+ 	// FilteredReflogCommits are the ones that appear in the reflog panel.
+ 	// When in filtering mode we only include the ones that match the given path
+ 	FilteredReflogCommits []*models.Commit
+diff --git a/pkg/gui/types/views.go b/pkg/gui/types/views.go
+index 46a67d23a..c510cb759 100644
+--- a/pkg/gui/types/views.go
++++ b/pkg/gui/types/views.go
+@@ -10,6 +10,7 @@ type Views struct {
+ 	Remotes        *gocui.View
+ 	Worktrees      *gocui.View
+ 	Tags           *gocui.View
++	PullRequests   *gocui.View
+ 	RemoteBranches *gocui.View
+ 	ReflogCommits  *gocui.View
+ 	Commits        *gocui.View
+diff --git a/pkg/gui/views.go b/pkg/gui/views.go
+index ba4b4373f..ee845088c 100644
+--- a/pkg/gui/views.go
++++ b/pkg/gui/views.go
+@@ -32,6 +32,7 @@ func (gui *Gui) orderedViewNameMappings() []viewNameMapping {
+ 		{viewPtr: &gui.Views.Worktrees, name: "worktrees"},
+ 		{viewPtr: &gui.Views.Files, name: "files"},
+ 		{viewPtr: &gui.Views.Tags, name: "tags"},
++		{viewPtr: &gui.Views.PullRequests, name: "pullRequests"},
+ 		{viewPtr: &gui.Views.Remotes, name: "remotes"},
+ 		{viewPtr: &gui.Views.Branches, name: "localBranches"},
+ 		{viewPtr: &gui.Views.RemoteBranches, name: "remoteBranches"},
+@@ -186,6 +187,7 @@ func (gui *Gui) configureViewProperties() {
+ 	gui.Views.Remotes.Title = gui.c.Tr.RemotesTitle
+ 	gui.Views.Worktrees.Title = gui.c.Tr.WorktreesTitle
+ 	gui.Views.Tags.Title = gui.c.Tr.TagsTitle
++	gui.Views.PullRequests.Title = gui.c.Tr.PullRequestsTitle
+ 	gui.Views.Files.Title = gui.c.Tr.FilesTitle
+ 	gui.Views.PatchBuilding.Title = gui.c.Tr.Patch
+ 	gui.Views.PatchBuildingSecondary.Title = gui.c.Tr.CustomPatch
+@@ -230,6 +232,7 @@ func (gui *Gui) configureViewProperties() {
+ 		gui.Views.Branches.TitlePrefix = jumpLabels[2]
+ 		gui.Views.Remotes.TitlePrefix = jumpLabels[2]
+ 		gui.Views.Tags.TitlePrefix = jumpLabels[2]
++		gui.Views.PullRequests.TitlePrefix = jumpLabels[2]
+ 
+ 		gui.Views.Commits.TitlePrefix = jumpLabels[3]
+ 		gui.Views.ReflogCommits.TitlePrefix = jumpLabels[3]
+@@ -247,6 +250,7 @@ func (gui *Gui) configureViewProperties() {
+ 		gui.Views.Branches.TitlePrefix = ""
+ 		gui.Views.Remotes.TitlePrefix = ""
+ 		gui.Views.Tags.TitlePrefix = ""
++		gui.Views.PullRequests.TitlePrefix = ""
+ 
+ 		gui.Views.Commits.TitlePrefix = ""
+ 		gui.Views.ReflogCommits.TitlePrefix = ""
+diff --git a/pkg/i18n/english.go b/pkg/i18n/english.go
+index 002adb114..78a5de7a0 100644
+--- a/pkg/i18n/english.go
++++ b/pkg/i18n/english.go
+@@ -342,6 +342,44 @@ type TranslationSet struct {
+ 	LocalBranchesTitle                    string
+ 	SearchTitle                           string
+ 	TagsTitle                             string
++	PullRequestsTitle                     string
++	RefreshPullRequests                   string
++	LoadingPullRequestDetails             string
++	OpenPullRequestInEditor               string
++	RefreshPullRequest                    string
++	AddPullRequestComment                 string
++	AddPullRequestCommentInEditor         string
++	PullRequestCommentBodyTitle           string
++	ReviewPullRequest                     string
++	ApprovePullRequest                    string
++	RequestChangesPullRequest             string
++	ConfirmApprovePullRequest             string
++	RequestChangesBody                    string
++	ConfirmOpenPullRequest                string
++	SendingPullRequestComment             string
++	SubmittingPullRequestReview           string
++	PullRequestCommentSent                string
++	PullRequestReviewSubmitted            string
++	AddPullRequestLineComment             string
++	AddPullRequestLineCommentInEditor     string
++	PRLineCommentOnlyInPRTab              string
++	PRLineCommentDeletedLines             string
++	NoGithubToken                         string
++	NoPullRequests                        string
++	PullRequestsDisabled                  string
++	PullRequestTitle                      string
++	CheckoutPullRequest                   string
++	NoGithubBaseRemote                    string
++	FetchingPullRequest                   string
++	MergePullRequest                      string
++	MergeCommitMethod                     string
++	SquashMergeMethod                     string
++	RebaseMergeMethod                     string
++	ConfirmMergePullRequest               string
++	FetchingMergeMethods                  string
++	MergingPullRequest                    string
++	PullRequestMerged                     string
++	PullRequestNotOpen                    string
+ 	MenuTitle                             string
+ 	CommitMenuTitle                       string
+ 	RemotesTitle                          string
+@@ -1086,6 +1124,7 @@ type Actions struct {
+ 	OpenMergeTool                    string
+ 	OpenCommitInBrowser              string
+ 	OpenPullRequest                  string
++	CheckoutPullRequest              string
+ 	StartBisect                      string
+ 	ResetBisect                      string
+ 	BisectSkip                       string
+@@ -1462,6 +1501,44 @@ func EnglishTranslationSet() *TranslationSet {
+ 		LocalBranchesTitle:                   "Local branches",
+ 		SearchTitle:                          "Search",
+ 		TagsTitle:                            "Tags",
++		PullRequestsTitle:                    "PR(gh)",
++		RefreshPullRequests:                  "Refresh pull requests",
++		LoadingPullRequestDetails:            "Loading details...",
++		OpenPullRequestInEditor:              "Open pull request description in editor",
++		RefreshPullRequest:                   "Refresh pull request details",
++		AddPullRequestComment:                "Add comment",
++		AddPullRequestCommentInEditor:        "Add comment using editor",
++		PullRequestCommentBodyTitle:          "Comment body",
++		ReviewPullRequest:                    "Review pull request",
++		ApprovePullRequest:                   "Approve",
++		RequestChangesPullRequest:            "Request changes",
++		ConfirmApprovePullRequest:            "Approve pull request #%d?",
++		RequestChangesBody:                   "Request changes: describe what to change",
++		ConfirmOpenPullRequest:               "Open pull request #%d in the browser?",
++		SendingPullRequestComment:            "Sending comment",
++		SubmittingPullRequestReview:          "Submitting review",
++		PullRequestCommentSent:               "Comment sent",
++		PullRequestReviewSubmitted:           "Review submitted",
++		AddPullRequestLineComment:            "Comment on selected lines in pull request",
++		AddPullRequestLineCommentInEditor:    "Comment on selected lines using editor",
++		PRLineCommentOnlyInPRTab:             "Only available for commits opened from the PR(gh) tab",
++		PRLineCommentDeletedLines:            "Select added or unchanged lines only",
++		NoGithubToken:                        "Not logged in to GitHub. Run 'gh auth login'",
++		NoPullRequests:                       "No open pull requests",
++		PullRequestsDisabled:                 "Pull requests are disabled (git.pullRequests.enabled)",
++		PullRequestTitle:                     "Pull request",
++		CheckoutPullRequest:                  "Checkout pull request",
++		NoGithubBaseRemote:                   "Cannot determine the GitHub base remote",
++		FetchingPullRequest:                  "Fetching pull request",
++		MergePullRequest:                     "Merge pull request",
++		MergeCommitMethod:                    "Create a merge commit",
++		SquashMergeMethod:                    "Squash and merge",
++		RebaseMergeMethod:                    "Rebase and merge",
++		ConfirmMergePullRequest:              "Merge pull request #%d (%s)?",
++		FetchingMergeMethods:                 "Fetching merge methods",
++		MergingPullRequest:                   "Merging pull request",
++		PullRequestMerged:                    "Pull request merged",
++		PullRequestNotOpen:                   "Only open pull requests can be merged",
+ 		MenuTitle:                            "Menu",
+ 		CommitMenuTitle:                      "Commit Menu",
+ 		RemotesTitle:                         "Remotes",
+@@ -2167,6 +2244,7 @@ func EnglishTranslationSet() *TranslationSet {
+ 			OpenMergeTool:                    "Open merge tool",
+ 			OpenCommitInBrowser:              "Open commit in browser",
+ 			OpenPullRequest:                  "Open pull request in browser",
++			CheckoutPullRequest:              "Checkout pull request",
+ 			StartBisect:                      "Start bisect",
+ 			ResetBisect:                      "Reset bisect",
+ 			BisectSkip:                       "Bisect skip",
