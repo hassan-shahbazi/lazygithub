@@ -7,7 +7,7 @@ Each tag of this repo matches the lazygit tag its patch applies to. Tag `v0.61.1
 ## Requirements
 
 - `gh`, authenticated, to list pull requests
-- `glow`, to render pull request descriptions
+- [`leaf`](https://leaf.rivolink.mg/), to render pull request descriptions
 
 ## Build from source
 
@@ -38,14 +38,14 @@ git:
   pullRequests:
     enabled: true
     filter: "is:open review-requested:@me"
-    style: "light"
+    style: "forest"
 ```
 
 | Key | Values | Default |
 | --- | --- | --- |
 | `git.pullRequests.enabled` | `true`, `false`. `false` stops all pull request requests and leaves the tab empty | `true` |
 | `git.pullRequests.filter` | A GitHub web search filter, for example `is:open review-requested:@me` | `is:open` |
-| `git.pullRequests.style` | The glow style for pull request details: `dark`, `light`, `dracula`, `tokyo-night`, `pink`, `ascii`, `notty`, or a path to a JSON style file | `dark` |
+| `git.pullRequests.style` | The leaf theme for pull request details: `arctic`, `forest`, `ocean`, `solarized-dark`, or a path to a TOML theme file. Empty uses leaf's own config | `""` |
 
 ## Keybindings
 

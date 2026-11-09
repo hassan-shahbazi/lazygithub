@@ -1129,7 +1129,7 @@ index 6477c6ee6..77769c0f4 100644
 +	Hidden      string    `json:"hidden"`
 +}
 diff --git a/pkg/config/user_config.go b/pkg/config/user_config.go
-index 29778d639..7ecb15937 100644
+index 29778d639..d5c7797f1 100644
 --- a/pkg/config/user_config.go
 +++ b/pkg/config/user_config.go
 @@ -330,6 +330,17 @@ type GitConfig struct {
@@ -1145,7 +1145,7 @@ index 29778d639..7ecb15937 100644
 +	Enabled bool `yaml:"enabled"`
 +	// GitHub search filter, same syntax as the web pull request list, e.g. "is:open review-requested:@me".
 +	Filter string `yaml:"filter"`
-+	// glow style for the pull request details: dark, light, dracula, tokyo-night, pink, ascii, notty, or a path to a JSON style file.
++	// leaf theme for the pull request details: arctic, forest, ocean, solarized-dark, or a path to a TOML theme file. Empty uses leaf's own config.
 +	Style string `yaml:"style"`
  }
  
@@ -1157,7 +1157,7 @@ index 29778d639..7ecb15937 100644
 +			PullRequests: PullRequestsConfig{
 +				Enabled: true,
 +				Filter:  "is:open",
-+				Style:   "dark",
++				Style:   "",
 +			},
  		},
  		Refresher: RefresherConfig{
@@ -1790,10 +1790,10 @@ index 4d418d7df..2d5f9d85a 100644
  		self.c.Tr.DiscardLinesFromCommitPrompt,
 diff --git a/pkg/gui/controllers/pull_requests_controller.go b/pkg/gui/controllers/pull_requests_controller.go
 new file mode 100644
-index 000000000..dfa21ec98
+index 000000000..f407e6fe7
 --- /dev/null
 +++ b/pkg/gui/controllers/pull_requests_controller.go
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,546 @@
 +package controllers
 +
 +import (
@@ -1993,11 +1993,14 @@ index 000000000..dfa21ec98
 +}
 +
 +func (self *PullRequestsController) renderDetails(d *models.GithubPullRequestDetails, width int) string {
-+	if _, err := exec.LookPath("glow"); err != nil {
++	if _, err := exec.LookPath("leaf"); err != nil {
 +		return ""
 +	}
-+	args := []string{"glow", "-s", self.c.UserConfig().Git.PullRequests.Style, "-w", strconv.Itoa(max(width, 40)), "-"}
-+	out, err := self.c.OS().Cmd.New(args).SetStdin(presentation.FormatPullRequestDetailsMarkdown(d)).AddEnvVars("CLICOLOR_FORCE=1").DontLog().RunWithOutput()
++	args := []string{"leaf", "--inline", "ansi:" + strconv.Itoa(max(width, 40))}
++	if theme := self.c.UserConfig().Git.PullRequests.Style; theme != "" {
++		args = append(args, "--theme", theme)
++	}
++	out, err := self.c.OS().Cmd.New(args).SetStdin(presentation.PullRequestHTMLToMarkdown(presentation.FormatPullRequestDetailsMarkdown(d))).DontLog().RunWithOutput()
 +	if err != nil {
 +		return ""
 +	}
@@ -2385,14 +2388,16 @@ index af292b380..a524a5637 100644
  )
 diff --git a/pkg/gui/presentation/pull_requests.go b/pkg/gui/presentation/pull_requests.go
 new file mode 100644
-index 000000000..fd03f7d5b
+index 000000000..e4935f099
 --- /dev/null
 +++ b/pkg/gui/presentation/pull_requests.go
-@@ -0,0 +1,252 @@
+@@ -0,0 +1,361 @@
 +package presentation
 +
 +import (
 +	"fmt"
++	"html"
++	"regexp"
 +	"strconv"
 +	"strings"
 +
@@ -2477,6 +2482,113 @@ index 000000000..fd03f7d5b
 +func mdTableCell(s string) string {
 +	s = strings.ReplaceAll(s, "|", "\\|")
 +	return strings.ReplaceAll(s, "\n", " ")
++}
++
++var (
++	mdCodeSpan  = regexp.MustCompile("`[^`\n]+`")
++	htmlComment = regexp.MustCompile(`(?s)<!--.*?-->`)
++	htmlImgAlt  = regexp.MustCompile(`(?is)<img\b[^>]*?\balt\s*=\s*"([^"]*)"[^>]*>`)
++	htmlLink    = regexp.MustCompile(`(?is)<a\b[^>]*?\bhref\s*=\s*"([^"]*)"[^>]*>(.*?)</a>`)
++	htmlDetails = regexp.MustCompile(`(?i)<(/?)details\b[^>]*>`)
++	htmlSummary = regexp.MustCompile(`(?is)<summary\b[^>]*>(.*?)</summary>`)
++	// Tags leaf prints literally or drops with their content; leaf renders b, i, em, strong, code, del, ins, u and br itself
++	htmlUnsupported = regexp.MustCompile(`(?i)</?(?:p|div|span|dl|dt|dd|h[1-6]|sup|sub|kbd|center|picture|source|img|a|details|summary)\b[^>]*>`)
++)
++
++// PullRequestHTMLToMarkdown rewrites GitHub's HTML into markdown leaf can render.
++// <details> blocks collapse to their summary line, as the GitHub web UI shows them.
++func PullRequestHTMLToMarkdown(s string) string {
++	s = collapseDetails(s)
++	lines := strings.Split(s, "\n")
++	inFence := false
++	start := 0
++	var out []string
++	flush := func(end int) {
++		if end > start {
++			out = append(out, outsideCodeSpans(strings.Join(lines[start:end], "\n"), inlineHTMLToMarkdown))
++		}
++	}
++	for i, l := range lines {
++		if strings.HasPrefix(strings.TrimSpace(l), "```") {
++			if !inFence {
++				flush(i)
++				start = i
++			} else {
++				out = append(out, strings.Join(lines[start:i+1], "\n"))
++				start = i + 1
++			}
++			inFence = !inFence
++		}
++	}
++	if inFence {
++		out = append(out, strings.Join(lines[start:], "\n"))
++	} else {
++		flush(len(lines))
++	}
++	return strings.Join(out, "\n")
++}
++
++func outsideCodeSpans(s string, f func(string) string) string {
++	var b strings.Builder
++	last := 0
++	for _, m := range mdCodeSpan.FindAllStringIndex(s, -1) {
++		b.WriteString(f(s[last:m[0]]))
++		b.WriteString(s[m[0]:m[1]])
++		last = m[1]
++	}
++	b.WriteString(f(s[last:]))
++	return b.String()
++}
++
++func inlineHTMLToMarkdown(s string) string {
++	s = htmlComment.ReplaceAllString(s, "")
++	s = htmlImgAlt.ReplaceAllString(s, "$1")
++	s = htmlLink.ReplaceAllStringFunc(s, func(m string) string {
++		sub := htmlLink.FindStringSubmatch(m)
++		text := strings.Join(strings.Fields(htmlUnsupported.ReplaceAllString(sub[2], "")), " ")
++		if text == "" {
++			return ""
++		}
++		return "[" + text + "](" + html.UnescapeString(sub[1]) + ")"
++	})
++	return htmlUnsupported.ReplaceAllString(s, "")
++}
++
++// shortcut: a <details> tag inside a fenced code block is collapsed too, rare in PR comments.
++func collapseDetails(s string) string {
++	spans := mdCodeSpan.FindAllStringIndex(s, -1)
++	var b strings.Builder
++	depth, last, open := 0, 0, 0
++	for _, m := range htmlDetails.FindAllStringSubmatchIndex(s, -1) {
++		if lo.ContainsBy(spans, func(sp []int) bool { return sp[0] < m[0] && m[1] < sp[1] }) {
++			continue
++		}
++		if m[3] == m[2] {
++			if depth == 0 {
++				open = m[0]
++			}
++			depth++
++			continue
++		}
++		if depth == 0 {
++			continue
++		}
++		depth--
++		if depth > 0 {
++			continue
++		}
++		summary := "Details"
++		if sm := htmlSummary.FindStringSubmatch(s[open:m[1]]); sm != nil {
++			if text := strings.Join(strings.Fields(inlineHTMLToMarkdown(sm[1])), " "); text != "" {
++				summary = text
++			}
++		}
++		b.WriteString(s[last:open])
++		b.WriteString("\n\n**▶ " + summary + "**\n\n")
++		last = m[1]
++	}
++	b.WriteString(s[last:])
++	return b.String()
 +}
 +
 +func FormatPullRequestDetailsMarkdown(d *models.GithubPullRequestDetails) string {
@@ -2640,6 +2752,78 @@ index 000000000..fd03f7d5b
 +		}
 +	}
 +	return strings.Join(lines, "\n")
++}
+diff --git a/pkg/gui/presentation/pull_requests_test.go b/pkg/gui/presentation/pull_requests_test.go
+new file mode 100644
+index 000000000..9af8489da
+--- /dev/null
++++ b/pkg/gui/presentation/pull_requests_test.go
+@@ -0,0 +1,66 @@
++package presentation
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestPullRequestHTMLToMarkdown(t *testing.T) {
++	scenarios := []struct {
++		name     string
++		input    string
++		expected string
++	}{
++		{
++			name:     "image becomes its alt text",
++			input:    `x <picture><source srcset="d.svg"><img src="l.svg" alt="Icon"></picture> y`,
++			expected: "x Icon y",
++		},
++		{
++			name:     "link around picture becomes markdown link",
++			input:    `<a href="https://x.y/?a=1&amp;b=2"><picture><img src="b.svg" alt="Explain →"></picture></a>`,
++			expected: "[Explain →](https://x.y/?a=1&b=2)",
++		},
++		{
++			name:     "empty link is dropped",
++			input:    `a<a href="u"><img src="b.svg"></a>b`,
++			expected: "ab",
++		},
++		{
++			name:     "block tags keep their content",
++			input:    "<dl><dd>text</dd></dl> <h6>head</h6> <strong>bold</strong>",
++			expected: "text head <strong>bold</strong>",
++		},
++		{
++			name:     "nested details collapse to the outer summary",
++			input:    "before\n<details>\n<summary><img alt=\"\"> Files: <b>3</b></summary>\n<details><summary>inner</summary>\nhidden\n</details>\n</details>\nafter",
++			expected: "before\n\n\n**▶ Files: <b>3</b>**\n\n\nafter",
++		},
++		{
++			name:     "html comments are dropped",
++			input:    "- [ ] <!-- {\"id\":1} --> Fix comments",
++			expected: "- [ ]  Fix comments",
++		},
++		{
++			name:     "details without summary",
++			input:    "<details>body</details>",
++			expected: "\n\n**▶ Details**\n\n",
++		},
++		{
++			name:     "inline code is left alone",
++			input:    "use `<div>` and `List<A>` <sup>x</sup> `<details>` end",
++			expected: "use `<div>` and `List<A>` x `<details>` end",
++		},
++		{
++			name:     "fenced code is left alone",
++			input:    "<sup>a</sup>\n```\nList<p> <img alt=\"x\">\n```\n<sup>b</sup>",
++			expected: "a\n```\nList<p> <img alt=\"x\">\n```\nb",
++		},
++	}
++	for _, s := range scenarios {
++		t.Run(s.name, func(t *testing.T) {
++			assert.Equal(t, s.expected, PullRequestHTMLToMarkdown(s.input))
++		})
++	}
 +}
 diff --git a/pkg/gui/types/common.go b/pkg/gui/types/common.go
 index 06c459add..a498cbba7 100644
