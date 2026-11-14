@@ -2,7 +2,7 @@
 
 A patch for [lazygit](https://github.com/jesseduffield/lazygit) that adds a "Pull requests" tab to the branches panel for GitHub remotes.
 
-Each tag of this repo matches the lazygit tag its patch applies to. Tag `v0.61.1` pins the `lazygit` submodule to lazygit `v0.61.1`.
+Each tag of this repo matches the lazygit tag its patch applies to. Tag `v0.66.3` pins the `lazygit` submodule to lazygit `v0.66.3`.
 
 ## Requirements
 
@@ -12,7 +12,7 @@ Each tag of this repo matches the lazygit tag its patch applies to. Tag `v0.61.1
 ## Build from source
 
 ```sh
-git clone --branch v0.61.1 https://github.com/<owner>/lazygithub
+git clone --branch v0.66.3 https://github.com/<owner>/lazygithub
 cd lazygithub
 make setup patch
 cd lazygit && go build
@@ -23,13 +23,13 @@ cd lazygit && go build
 The overlay patches `lazygit` from your nixpkgs. That nixpkgs must ship the lazygit version of the tag you use.
 
 ```nix
-inputs.lazygithub.url = "github:<owner>/lazygithub/v0.61.1";
+inputs.lazygithub.url = "github:<owner>/lazygithub/v0.66.3";
 inputs.lazygithub.inputs.nixpkgs.follows = "nixpkgs";
 
 nixpkgs.overlays = [ inputs.lazygithub.overlays.default ];
 ```
 
-`nix run github:<owner>/lazygithub/v0.61.1` runs it with the nixpkgs locked in this repo.
+`nix run github:<owner>/lazygithub/v0.66.3` runs it with the nixpkgs locked in this repo.
 
 ## Configuration
 
@@ -46,6 +46,8 @@ git:
 | `git.pullRequests.enabled` | `true`, `false`. `false` stops all pull request requests and leaves the tab empty | `true` |
 | `git.pullRequests.filter` | A GitHub web search filter, for example `is:open review-requested:@me` | `is:open` |
 | `git.pullRequests.style` | The leaf theme for pull request details: `arctic`, `forest`, `ocean`, `solarized-dark`, or a path to a TOML theme file. Empty uses leaf's own config | `""` |
+
+A `gui.sidePanels` setting of your own replaces the default panels. Add `pullRequests` to one of its panels to show the tab, for example `[branches, pullRequests, remotes, tags]`.
 
 ## Keybindings
 
@@ -68,7 +70,7 @@ Pull requests tab:
 | `G` | `branches.openPullRequestInBrowser` | Open in the browser |
 | `<c-y>` | `branches.copyPullRequestURL` | Copy the pull request URL |
 
-Patch view of a file in a pull request commit:
+Focused diff of a pull request commit, or of a file in it (`0` from the commits or files panel):
 
 | Key | lazygit key | Action |
 | --- | --- | --- |
@@ -87,5 +89,3 @@ git add lazygit pr-tab.patch && git commit && git tag vX.Y.Z
 ```
 
 Bump `nixpkgs` in `flake.nix` to a revision that ships lazygit `vX.Y.Z`.
-
-A fix to an already tagged patch gets a new tag, for example `v0.61.1-2`.
