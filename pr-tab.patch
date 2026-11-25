@@ -1674,10 +1674,10 @@ index 000000000..570cddf08
 +}
 diff --git a/pkg/gui/controllers/pull_requests_controller.go b/pkg/gui/controllers/pull_requests_controller.go
 new file mode 100644
-index 000000000..b584de938
+index 000000000..bb19291e8
 --- /dev/null
 +++ b/pkg/gui/controllers/pull_requests_controller.go
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,589 @@
 +package controllers
 +
 +import (
@@ -1703,9 +1703,11 @@ index 000000000..b584de938
 +type PullRequestsController struct {
 +	baseController
 +	*ListControllerTrait[*models.GithubPullRequest]
-+	c               *ControllerCommon
-+	loadingDetails  map[int]bool
-+	renderedDetails map[int]string
++	c                *ControllerCommon
++	loadingDetails   map[int]bool
++	renderedDetails  map[int]string
++	renderingDetails map[int]bool
++	unfoldComments   bool
 +}
 +
 +var _ types.IController = &PullRequestsController{}
@@ -1721,9 +1723,10 @@ index 000000000..b584de938
 +			c.Contexts().PullRequests.GetSelected,
 +			c.Contexts().PullRequests.GetSelectedItems,
 +		),
-+		c:               c,
-+		loadingDetails:  map[int]bool{},
-+		renderedDetails: map[int]string{},
++		c:                c,
++		loadingDetails:   map[int]bool{},
++		renderedDetails:  map[int]string{},
++		renderingDetails: map[int]bool{},
 +	}
 +}
 +
@@ -1774,6 +1777,11 @@ index 000000000..b584de938
 +			GetDisabledReason: self.require(self.singleItemSelected()),
 +			Description:       self.c.Tr.RefreshPullRequest,
 +			DisplayOnScreen:   true,
++		},
++		{
++			Keys:        opts.GetKeys(opts.Config.Files.ExpandAll),
++			Handler:     self.toggleFolds,
++			Description: self.c.Tr.TogglePullRequestFolds,
 +		},
 +		{
 +			Keys:              opts.GetKeys(opts.Config.Files.CommitChanges),
@@ -1829,10 +1837,15 @@ index 000000000..b584de938
 +		if pr == nil {
 +			task = types.NewRenderStringTask(self.c.Tr.NoPullRequests)
 +		} else {
-+			if r := self.renderedDetails[pr.Number]; r != "" {
++			r, rendered := self.renderedDetails[pr.Number]
++			d := self.c.Model().PullRequestDetails[pr.Number]
++			if r != "" {
 +				task = types.NewRenderStringTask(r)
-+			} else if d := self.c.Model().PullRequestDetails[pr.Number]; d != nil {
-+				task = types.NewRenderStringTask(presentation.FormatPullRequestDetails(d))
++			} else if d != nil {
++				task = types.NewRenderStringTask(presentation.FormatPullRequestDetails(d, self.unfoldComments))
++				if !rendered {
++					self.renderInBackground(pr.Number, d)
++				}
 +			} else {
 +				text := strings.Join([]string{
 +					fmt.Sprintf("#%d %s", pr.Number, pr.Title),
@@ -1876,7 +1889,7 @@ index 000000000..b584de938
 +	}
 +}
 +
-+func (self *PullRequestsController) renderDetails(d *models.GithubPullRequestDetails, width int) string {
++func (self *PullRequestsController) renderDetails(d *models.GithubPullRequestDetails, width int, unfold bool) string {
 +	if _, err := exec.LookPath("leaf"); err != nil {
 +		return ""
 +	}
@@ -1884,7 +1897,7 @@ index 000000000..b584de938
 +	if theme := self.c.UserConfig().Git.PullRequests.Style; theme != "" {
 +		args = append(args, "--theme", theme)
 +	}
-+	out, err := self.c.OS().Cmd.New(args).SetStdin(presentation.PullRequestHTMLToMarkdown(presentation.FormatPullRequestDetailsMarkdown(d))).DontLog().RunWithOutput()
++	out, err := self.c.OS().Cmd.New(args).SetStdin(presentation.PullRequestHTMLToMarkdown(presentation.FormatPullRequestDetailsMarkdown(d, unfold), unfold)).DontLog().RunWithOutput()
 +	if err != nil {
 +		return ""
 +	}
@@ -1898,12 +1911,13 @@ index 000000000..b584de938
 +	self.loadingDetails[number] = true
 +
 +	width := self.c.Views().Main.InnerWidth()
++	unfold := self.unfoldComments
 +
 +	self.c.OnWorker(func(gocui.Task) error {
 +		d, err := self.c.Helpers().Refresh.FetchPullRequestDetails(number)
 +		var rendered string
 +		if err == nil {
-+			rendered = self.renderDetails(d, width)
++			rendered = self.renderDetails(d, width, unfold)
 +		}
 +		self.c.OnUIThread(func() error {
 +			delete(self.loadingDetails, number)
@@ -1915,9 +1929,7 @@ index 000000000..b584de938
 +				self.c.Model().PullRequestDetails = map[int]*models.GithubPullRequestDetails{}
 +			}
 +			self.c.Model().PullRequestDetails[number] = d
-+			if rendered != "" {
-+				self.renderedDetails[number] = rendered
-+			}
++			self.storeRendered(number, d, unfold, rendered)
 +			if sel := self.context().GetSelected(); sel != nil && sel.Number == number {
 +				self.context().HandleRenderToMain()
 +			}
@@ -1925,6 +1937,42 @@ index 000000000..b584de938
 +		})
 +		return nil
 +	})
++}
++
++func (self *PullRequestsController) storeRendered(number int, d *models.GithubPullRequestDetails, unfold bool, rendered string) {
++	if unfold == self.unfoldComments && self.c.Model().PullRequestDetails[number] == d {
++		self.renderedDetails[number] = rendered
++	}
++}
++
++func (self *PullRequestsController) renderInBackground(number int, d *models.GithubPullRequestDetails) {
++	if self.renderingDetails[number] {
++		return
++	}
++	self.renderingDetails[number] = true
++
++	width := self.c.Views().Main.InnerWidth()
++	unfold := self.unfoldComments
++
++	self.c.OnWorker(func(gocui.Task) error {
++		rendered := self.renderDetails(d, width, unfold)
++		self.c.OnUIThread(func() error {
++			delete(self.renderingDetails, number)
++			self.storeRendered(number, d, unfold, rendered)
++			if sel := self.context().GetSelected(); sel != nil && sel.Number == number {
++				self.context().HandleRenderToMain()
++			}
++			return nil
++		})
++		return nil
++	})
++}
++
++func (self *PullRequestsController) toggleFolds() error {
++	self.unfoldComments = !self.unfoldComments
++	self.renderedDetails = map[int]string{}
++	self.context().HandleRenderToMain()
++	return nil
 +}
 +
 +func (self *PullRequestsController) refreshDetails(pr *models.GithubPullRequest) error {
@@ -2199,7 +2247,7 @@ index 000000000..b584de938
 +func (self *PullRequestsController) openInEditor(pr *models.GithubPullRequest) error {
 +	d := self.c.Model().PullRequestDetails[pr.Number]
 +	path := filepath.Join(self.c.OS().GetTempDir(), self.c.Git().RepoPaths.RepoName(), fmt.Sprintf("pr-%d.md", pr.Number))
-+	if err := self.c.OS().CreateFileWithContent(path, presentation.FormatPullRequestDetailsMarkdown(d)); err != nil {
++	if err := self.c.OS().CreateFileWithContent(path, presentation.FormatPullRequestDetailsMarkdown(d, self.unfoldComments)); err != nil {
 +		return err
 +	}
 +	return self.c.Helpers().Files.EditFiles([]string{path})
@@ -2233,10 +2281,10 @@ index af292b380..a524a5637 100644
  )
 diff --git a/pkg/gui/presentation/pull_requests.go b/pkg/gui/presentation/pull_requests.go
 new file mode 100644
-index 000000000..4f1ba576e
+index 000000000..531137a5b
 --- /dev/null
 +++ b/pkg/gui/presentation/pull_requests.go
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,370 @@
 +package presentation
 +
 +import (
@@ -2341,9 +2389,11 @@ index 000000000..4f1ba576e
 +)
 +
 +// PullRequestHTMLToMarkdown rewrites GitHub's HTML into markdown leaf can render.
-+// <details> blocks collapse to their summary line, as the GitHub web UI shows them.
-+func PullRequestHTMLToMarkdown(s string) string {
-+	s = collapseDetails(s)
++// <details> blocks collapse to their summary line unless unfold is set.
++func PullRequestHTMLToMarkdown(s string, unfold bool) string {
++	if !unfold {
++		s = collapseDetails(s)
++	}
 +	lines := strings.Split(s, "\n")
 +	inFence := false
 +	start := 0
@@ -2386,6 +2436,7 @@ index 000000000..4f1ba576e
 +}
 +
 +func inlineHTMLToMarkdown(s string) string {
++	s = htmlSummary.ReplaceAllString(s, "\n\n**▼ $1**\n\n")
 +	s = htmlComment.ReplaceAllString(s, "")
 +	s = htmlImgAlt.ReplaceAllString(s, "$1")
 +	s = htmlLink.ReplaceAllStringFunc(s, func(m string) string {
@@ -2436,7 +2487,7 @@ index 000000000..4f1ba576e
 +	return b.String()
 +}
 +
-+func FormatPullRequestDetailsMarkdown(d *models.GithubPullRequestDetails) string {
++func FormatPullRequestDetailsMarkdown(d *models.GithubPullRequestDetails, unfold bool) string {
 +	sections := []string{
 +		fmt.Sprintf("# #%d %s", d.Number, d.Title),
 +		fmt.Sprintf("**State:** %s · **Author:** @%s\n%s", d.State, d.Author, d.Url),
@@ -2502,9 +2553,12 @@ index 000000000..4f1ba576e
 +					commentsCount = "1 comment"
 +				}
 +				blocks = append(blocks, heading+" · ✔ Resolved ("+commentsCount+")")
-+			} else if c.Hidden != "" {
++			} else if c.Hidden != "" && !unfold {
 +				blocks = append(blocks, heading+" · Hidden: "+c.Hidden)
 +			} else {
++				if c.Hidden != "" {
++					heading += " · Hidden: " + c.Hidden
++				}
 +				cBody := strings.ReplaceAll(c.Body, "\r\n", "\n")
 +				if cBody == "" {
 +					cBody = "_No text_"
@@ -2519,7 +2573,7 @@ index 000000000..4f1ba576e
 +	return strings.Join(sections, "\n\n")
 +}
 +
-+func FormatPullRequestDetails(d *models.GithubPullRequestDetails) string {
++func FormatPullRequestDetails(d *models.GithubPullRequestDetails, unfold bool) string {
 +	lines := []string{
 +		style.AttrBold.Sprint("#" + strconv.Itoa(d.Number) + " " + d.Title),
 +		"State: " + WithPrColor(d.State, d.State, false) + "   " + style.FgCyan.Sprint("Author: "+d.Author),
@@ -2580,9 +2634,12 @@ index 000000000..4f1ba576e
 +					commentsCount = "1 comment"
 +				}
 +				lines = append(lines, header+" · "+style.FgGreen.Sprint("Resolved ("+commentsCount+")"))
-+			} else if c.Hidden != "" {
++			} else if c.Hidden != "" && !unfold {
 +				lines = append(lines, header+" · "+style.FgBlackLighter.Sprint("Hidden: "+c.Hidden))
 +			} else {
++				if c.Hidden != "" {
++					header += " · " + style.FgBlackLighter.Sprint("Hidden: "+c.Hidden)
++				}
 +				lines = append(lines, header)
 +				cBody := strings.ReplaceAll(c.Body, "\r\n", "\n")
 +				if cBody != "" {
@@ -2597,6 +2654,54 @@ index 000000000..4f1ba576e
 +		}
 +	}
 +	return strings.Join(lines, "\n")
++}
+diff --git a/pkg/gui/presentation/pull_requests_test.go b/pkg/gui/presentation/pull_requests_test.go
+new file mode 100644
+index 000000000..2e031744e
+--- /dev/null
++++ b/pkg/gui/presentation/pull_requests_test.go
+@@ -0,0 +1,42 @@
++package presentation
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestPullRequestHTMLToMarkdown(t *testing.T) {
++	input := "a\n<details><summary>More</summary>\nsecret\n</details>\nb"
++
++	cases := []struct {
++		name        string
++		unfold      bool
++		contains    []string
++		notContains []string
++	}{
++		{
++			name:        "collapsed",
++			unfold:      false,
++			contains:    []string{"**▶ More**"},
++			notContains: []string{"secret"},
++		},
++		{
++			name:     "unfolded",
++			unfold:   true,
++			contains: []string{"**▼ More**", "secret"},
++		},
++	}
++
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			out := PullRequestHTMLToMarkdown(input, c.unfold)
++			for _, s := range c.contains {
++				assert.Contains(t, out, s)
++			}
++			for _, s := range c.notContains {
++				assert.NotContains(t, out, s)
++			}
++		})
++	}
 +}
 diff --git a/pkg/gui/pull_requests.go b/pkg/gui/pull_requests.go
 new file mode 100644
@@ -2701,10 +2806,10 @@ index b71d084a6..3019051c4 100644
  }
 diff --git a/pkg/i18n/english_pull_requests.go b/pkg/i18n/english_pull_requests.go
 new file mode 100644
-index 000000000..5eafe8c47
+index 000000000..84452acfa
 --- /dev/null
 +++ b/pkg/i18n/english_pull_requests.go
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,89 @@
 +package i18n
 +
 +type PullRequestTranslations struct {
@@ -2747,6 +2852,7 @@ index 000000000..5eafe8c47
 +	MergingPullRequest                string
 +	PullRequestMerged                 string
 +	PullRequestNotOpen                string
++	TogglePullRequestFolds            string
 +}
 +
 +func englishPullRequestTranslations() PullRequestTranslations {
@@ -2790,5 +2896,6 @@ index 000000000..5eafe8c47
 +		MergingPullRequest:                "Merging pull request",
 +		PullRequestMerged:                 "Pull request merged",
 +		PullRequestNotOpen:                "Only open pull requests can be merged",
++		TogglePullRequestFolds:            "Fold/unfold hidden comments and sections",
 +	}
 +}
