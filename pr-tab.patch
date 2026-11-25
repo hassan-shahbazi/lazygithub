@@ -1,9 +1,9 @@
 diff --git a/pkg/commands/git_commands/github_pull_requests.go b/pkg/commands/git_commands/github_pull_requests.go
 new file mode 100644
-index 000000000..7332c3e06
+index 000000000..3b9fd5ca7
 --- /dev/null
 +++ b/pkg/commands/git_commands/github_pull_requests.go
-@@ -0,0 +1,879 @@
+@@ -0,0 +1,884 @@
 +package git_commands
 +
 +import (
@@ -770,8 +770,9 @@ index 000000000..7332c3e06
 +		}
 +	}
 +
-+	comments := []models.GithubComment{}
++	groups := [][]models.GithubComment{}
 +	for _, item := range pr.TimelineItems.Nodes {
++		group := []models.GithubComment{}
 +		switch item.Typename {
 +		case "IssueComment":
 +			c := models.GithubComment{
@@ -780,7 +781,7 @@ index 000000000..7332c3e06
 +				CreatedAt: parseCreatedAt(item.CreatedAt),
 +			}
 +			c.Hidden = hiddenReason(item.IsMinimized, item.MinimizedReason)
-+			comments = append(comments, c)
++			group = append(group, c)
 +		case "PullRequestReview":
 +			if item.Body != "" || item.State != "COMMENTED" {
 +				c := models.GithubComment{
@@ -790,12 +791,12 @@ index 000000000..7332c3e06
 +					CreatedAt:   parseCreatedAt(item.CreatedAt),
 +				}
 +				c.Hidden = hiddenReason(item.IsMinimized, item.MinimizedReason)
-+				comments = append(comments, c)
++				group = append(group, c)
 +			}
 +			for _, c := range item.Comments.Nodes {
 +				if tid, ok := resolvedThreadMap[c.ID]; ok {
 +					if c.ID == tid.firstID {
-+						comments = append(comments, models.GithubComment{
++						group = append(group, models.GithubComment{
 +							Author:     authorLogin(c.Author),
 +							Body:       c.Body,
 +							Path:       c.Path,
@@ -807,7 +808,7 @@ index 000000000..7332c3e06
 +					}
 +					// skip non-first comments in resolved threads
 +				} else {
-+					comments = append(comments, models.GithubComment{
++					group = append(group, models.GithubComment{
 +						Author:    authorLogin(c.Author),
 +						Body:      c.Body,
 +						Path:      c.Path,
@@ -817,7 +818,11 @@ index 000000000..7332c3e06
 +				}
 +			}
 +		}
++		if len(group) > 0 {
++			groups = append(groups, group)
++		}
 +	}
++	comments := lo.Flatten(lo.Reverse(groups))
 +
 +	return &models.GithubPullRequestDetails{
 +		NodeID:         pr.ID,
@@ -882,6 +887,77 @@ index 000000000..7332c3e06
 +		return pr.HeadRefName
 +	}
 +	return pr.HeadRepositoryOwner.Login + "/" + pr.HeadRefName
++}
+diff --git a/pkg/commands/git_commands/github_pull_requests_test.go b/pkg/commands/git_commands/github_pull_requests_test.go
+new file mode 100644
+index 000000000..ac2573dbe
+--- /dev/null
++++ b/pkg/commands/git_commands/github_pull_requests_test.go
+@@ -0,0 +1,65 @@
++package git_commands
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestParsePullRequestDetailsOrdering(t *testing.T) {
++	body := `{
++  "data": {
++    "repository": {
++      "pullRequest": {
++        "id": "PR_1",
++        "number": 1,
++        "title": "Test",
++        "body": "",
++        "state": "OPEN",
++        "isDraft": false,
++        "url": "https://github.com/o/r/pull/1",
++        "author": {"login": "alice"},
++        "reviewDecision": "",
++        "timelineItems": {
++          "nodes": [
++            {
++              "__typename": "IssueComment",
++              "id": "ic1",
++              "author": {"login": "alice"},
++              "body": "first",
++              "createdAt": "2026-01-01T00:00:00Z"
++            },
++            {
++              "__typename": "PullRequestReview",
++              "author": {"login": "bob"},
++              "state": "APPROVED",
++              "body": "lgtm",
++              "createdAt": "2026-01-02T00:00:00Z",
++              "comments": {
++                "nodes": [
++                  {
++                    "id": "c1",
++                    "author": {"login": "bob"},
++                    "body": "inline",
++                    "path": "f.go",
++                    "createdAt": "2026-01-02T00:00:00Z"
++                  }
++                ]
++              }
++            }
++          ]
++        }
++      }
++    }
++  }
++}`
++
++	d, err := parsePullRequestDetails([]byte(body))
++	assert.NoError(t, err)
++
++	bodies := []string{}
++	for _, c := range d.Comments {
++		bodies = append(bodies, c.Body)
++	}
++	assert.Equal(t, []string{"lgtm", "inline", "first"}, bodies)
 +}
 diff --git a/pkg/commands/models/github.go b/pkg/commands/models/github.go
 index da7bd79db..9c0d1267c 100644
